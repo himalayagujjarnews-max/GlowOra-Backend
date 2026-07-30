@@ -1,0 +1,314 @@
+/**
+ * Auth controller — OTP login for customers/owners, password login for
+ * owners/admins, token refresh with rotation, logout, FCM registration,
+ * and password reset. Includes account lockout on repeated failures.
+ */
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const sendResponse = require('../utils/ApiResponse');
+const { generateOtp, saveOtp, sendSms, verifyOtp, isOnCooldown } = require('../utils/otp');
+const { sendEmailOtp } = require('../utils/email');
+const { hashPassword, comparePassword, isStrong } = require('../utils/password');
+const { decrypt, sha256 } = require('../utils/encryption');
+const totp = require('../utils/totp');
+const sessionService = require('../services/session.service');
+const User = require('../models/User');
+const LoginHistory = require('../models/LoginHistory');
+const config = require('../config/env');
+const { notifyUser } = require('../services/notification.service');
+
+function publicUser(u) {
+  return {
+    id: u._id, name: u.name, phone: u.phone, email: u.email, role: u.role,
+    avatar: u.avatar, city: u.city, walletBalance: u.walletBalance,
+    glowPoints: u.glowPoints, referralCode: u.referralCode,
+    gender: u.gender, dob: u.dob, emailVerified: u.emailVerified,
+    hasPassword: Boolean(u.password),
+    twoFactorEnabled: u.twoFactorEnabled,
+  };
+}
+
+function reqCtx(req) {
+  return { ip: req.ip, userAgent: req.headers['user-agent'] };
+}
+
+async function logLogin(user, method, success, req, reason) {
+  try {
+    await LoginHistory.create({
+      user: user ? user._id : undefined,
+      phone: user ? user.phone : req.body.phone,
+      method, success, reason,
+      ip: req.ip, userAgent: req.headers['user-agent'],
+      device: sessionService.parseUA(req.headers['user-agent']),
+    });
+  } catch { /* non-fatal */ }
+}
+
+/** Verify a 2FA code OR a one-time backup code. Consumes backup codes. */
+async function verifyTwoFactor(user, code) {
+  if (!code) return false;
+  const secret = user.twoFactorSecret ? decrypt(user.twoFactorSecret) : null;
+  if (secret && totp.verifyToken(secret, code)) return true;
+  // backup code path
+  const hash = sha256(String(code).toUpperCase());
+  const idx = (user.twoFactorBackupCodes || []).indexOf(hash);
+  if (idx !== -1) {
+    user.twoFactorBackupCodes.splice(idx, 1);
+    await user.save();
+    return true;
+  }
+  return false;
+}
+
+// POST /auth/send-otp  { phone }
+exports.sendOtp = asyncHandler(async (req, res) => {
+  const { phone } = req.body;
+  if (!/^[6-9]\d{9}$/.test(phone || '')) throw ApiError.badRequest('Enter a valid 10-digit mobile number');
+  if (await isOnCooldown(phone)) throw ApiError.tooMany('Please wait before requesting another code.');
+
+  const otp = generateOtp();
+  await saveOtp(phone, otp);
+  await sendSms(phone, otp);
+  sendResponse(res, 200, 'OTP sent successfully', { phone, expiresInSeconds: config.otp.ttlSeconds });
+});
+
+// POST /auth/verify-otp  { phone, otp, name?, role?, referralCode? }
+exports.verifyOtp = asyncHandler(async (req, res) => {
+  const { phone, otp, name, role, referralCode } = req.body;
+  if (!phone || !otp) throw ApiError.badRequest('Phone and OTP are required');
+
+  const result = await verifyOtp(phone, otp);
+  if (!result.ok) {
+    const map = {
+      too_many_attempts: 'Too many incorrect attempts. Request a new code.',
+      expired: 'Code expired. Please request a new one.',
+      invalid: 'Incorrect code. Please try again.',
+    };
+    throw ApiError.badRequest(map[result.reason] || 'Verification failed');
+  }
+
+  let user = await User.findOne({ phone }).select('+twoFactorSecret +twoFactorBackupCodes');
+  let isNew = false;
+  if (!user) {
+    // referral handling
+    let referredBy;
+    if (referralCode) {
+      const ref = await User.findOne({ referralCode: referralCode.toUpperCase() });
+      if (ref) referredBy = ref._id;
+    }
+    user = await User.create({
+      phone,
+      name: name || undefined,
+      role: role && ['customer', 'owner'].includes(role) ? role : 'customer',
+      phoneVerified: true,
+      referredBy,
+      lastLoginAt: new Date(),
+    });
+    isNew = true;
+
+    // reward referrer
+    if (referredBy) {
+      await User.findByIdAndUpdate(referredBy, { $inc: { walletBalance: config.referralBonus } });
+      notifyUser(referredBy, {
+        title: 'Referral bonus! 🎉',
+        body: `You earned ₹${config.referralBonus} because ${name || 'a friend'} joined GlowOra.`,
+        type: 'promo',
+      });
+    }
+  } else {
+    user.phoneVerified = true;
+    user.lastLoginAt = new Date();
+    if (name && !user.name) user.name = name;
+    await user.save();
+  }
+
+  // 2FA gate
+  if (user.twoFactorEnabled) {
+    if (!req.body.twoFactorCode) {
+      return sendResponse(res, 200, 'Two-factor code required', { twoFactorRequired: true, phone });
+    }
+    if (!(await verifyTwoFactor(user, req.body.twoFactorCode))) {
+      await logLogin(user, '2fa', false, req, 'invalid_2fa');
+      throw ApiError.unauthorized('Invalid two-factor code');
+    }
+  }
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'otp', true, req);
+  sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Logged in successfully', {
+    isNewUser: isNew, user: publicUser(user), ...tokens,
+  });
+});
+
+// POST /auth/login  { phone|email, password }  — login by phone OR email
+exports.login = asyncHandler(async (req, res) => {
+  const { phone, email, password } = req.body;
+  const identifier = email ? String(email).trim().toLowerCase() : phone;
+  if (!identifier || !password) throw ApiError.badRequest('Phone/email and password are required');
+
+  const query = email ? { email: identifier } : { phone: identifier };
+  const user = await User.findOne(query)
+    .select('+password +loginAttempts +lockUntil +active +twoFactorSecret +twoFactorBackupCodes');
+  if (!user || !user.password) { await logLogin(user, 'password', false, req, 'no_account'); throw ApiError.unauthorized('Invalid credentials'); }
+  if (user.active === false) throw ApiError.forbidden('Your account has been blocked.');
+
+  if (user.lockUntil && user.lockUntil > Date.now()) {
+    throw ApiError.tooMany('Account temporarily locked due to failed attempts. Try again later.');
+  }
+
+  const ok = await comparePassword(password, user.password);
+  if (!ok) {
+    user.loginAttempts = (user.loginAttempts || 0) + 1;
+    if (user.loginAttempts >= config.security.maxLoginAttempts) {
+      user.lockUntil = new Date(Date.now() + config.security.lockMinutes * 60 * 1000);
+      user.loginAttempts = 0;
+    }
+    await user.save();
+    await logLogin(user, 'password', false, req, 'bad_password');
+    throw ApiError.unauthorized('Invalid credentials');
+  }
+
+  // 2FA gate
+  if (user.twoFactorEnabled) {
+    if (!req.body.twoFactorCode) {
+      return sendResponse(res, 200, 'Two-factor code required', { twoFactorRequired: true, phone });
+    }
+    if (!(await verifyTwoFactor(user, req.body.twoFactorCode))) {
+      await logLogin(user, '2fa', false, req, 'invalid_2fa');
+      throw ApiError.unauthorized('Invalid two-factor code');
+    }
+  }
+
+  user.loginAttempts = 0;
+  user.lockUntil = undefined;
+  user.lastLoginAt = new Date();
+  await user.save();
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'password', true, req);
+  sendResponse(res, 200, 'Logged in successfully', { user: publicUser(user), ...tokens });
+});
+
+// POST /auth/set-password  (protected) { password }
+exports.setPassword = asyncHandler(async (req, res) => {
+  const { password } = req.body;
+  if (!isStrong(password)) throw ApiError.badRequest('Password must be 8+ chars with letters and numbers');
+  const user = await User.findById(req.user._id).select('+password');
+  user.password = await hashPassword(password);
+  user.passwordChangedAt = new Date();
+  await user.save();
+  sendResponse(res, 200, 'Password set successfully');
+});
+
+// POST /auth/forgot-password  { phone } — sends OTP as reset code
+exports.forgotPassword = asyncHandler(async (req, res) => {
+  const { phone } = req.body;
+  const user = await User.findOne({ phone });
+  if (!user) throw ApiError.notFound('No account with that number');
+  if (await isOnCooldown(phone)) throw ApiError.tooMany('Please wait before requesting another code.');
+  const otp = generateOtp();
+  await saveOtp(phone, otp);
+  await sendSms(phone, otp);
+  sendResponse(res, 200, 'Reset code sent', { phone });
+});
+
+// POST /auth/reset-password  { phone, otp, password }
+exports.resetPassword = asyncHandler(async (req, res) => {
+  const { phone, otp, password } = req.body;
+  if (!phone || !otp || !password) throw ApiError.badRequest('phone, otp and password are required');
+  if (!isStrong(password)) throw ApiError.badRequest('Password must be 8+ chars with letters and numbers');
+  const result = await verifyOtp(phone, otp);
+  if (!result.ok) throw ApiError.badRequest('Invalid or expired code');
+  const user = await User.findOne({ phone }).select('+password');
+  if (!user) throw ApiError.notFound('Account not found');
+  user.password = await hashPassword(password);
+  user.passwordChangedAt = new Date();
+  user.loginAttempts = 0;
+  user.lockUntil = undefined;
+  await user.save();
+  sendResponse(res, 200, 'Password reset successfully');
+});
+
+// POST /auth/refresh  { refreshToken }  — session-backed rotation + reuse detection
+exports.refresh = asyncHandler(async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) throw ApiError.badRequest('Refresh token required');
+  try {
+    const tokens = await sessionService.rotate(refreshToken, reqCtx(req));
+    sendResponse(res, 200, 'Token refreshed', tokens);
+  } catch (err) {
+    if (err.code === 'REUSE') throw ApiError.unauthorized('Security alert: token reuse detected. Please log in again.');
+    throw ApiError.unauthorized('Invalid or expired refresh token');
+  }
+});
+
+// POST /auth/logout  (protected)  { fcmToken? }
+exports.logout = asyncHandler(async (req, res) => {
+  if (req.user.sid) await sessionService.revoke(req.user.sid, 'logout');
+  if (req.body.fcmToken) {
+    await User.findByIdAndUpdate(req.user._id, { $pull: { fcmTokens: req.body.fcmToken } });
+  }
+  sendResponse(res, 200, 'Logged out successfully');
+});
+
+// POST /auth/fcm-token  (protected)  { fcmToken }
+exports.registerFcm = asyncHandler(async (req, res) => {
+  const { fcmToken } = req.body;
+  if (!fcmToken) throw ApiError.badRequest('fcmToken required');
+  await User.findByIdAndUpdate(req.user._id, { $addToSet: { fcmTokens: fcmToken } });
+  sendResponse(res, 200, 'Device registered for notifications');
+});
+
+// GET /auth/me  (protected)
+exports.getMe = asyncHandler(async (req, res) => {
+  sendResponse(res, 200, 'Current user', { user: publicUser(req.user) });
+});
+
+const EMAIL_RE = /^\S+@\S+\.\S+$/;
+
+// POST /auth/send-email-otp  { email }
+exports.sendEmailOtp = asyncHandler(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) throw ApiError.badRequest('Enter a valid email address');
+  if (await isOnCooldown(email)) throw ApiError.tooMany('Please wait before requesting another code.');
+  const otp = generateOtp();
+  await saveOtp(email, otp);       // otp store keys on any string, so email works
+  await sendEmailOtp(email, otp);
+  sendResponse(res, 200, 'Verification code sent to your email', { email, expiresInSeconds: config.otp.ttlSeconds });
+});
+
+// POST /auth/verify-email  { email, otp, name?, phone? }
+// Verifies the email code. Logs the user in (creates account if new).
+exports.verifyEmail = asyncHandler(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const { otp, name, phone } = req.body;
+  if (!EMAIL_RE.test(email) || !otp) throw ApiError.badRequest('Email and code are required');
+
+  const result = await verifyOtp(email, otp);
+  if (!result.ok) {
+    const map = { too_many_attempts: 'Too many incorrect attempts. Request a new code.', expired: 'Code expired. Please request a new one.', invalid: 'Incorrect code. Please try again.' };
+    throw ApiError.badRequest(map[result.reason] || 'Verification failed');
+  }
+
+  let user = await User.findOne({ email });
+  let isNew = false;
+  if (!user) {
+    // if a phone was supplied and matches an existing account, attach email to it
+    if (phone) user = await User.findOne({ phone });
+    if (!user) {
+      user = await User.create({ email, name: name || undefined, phone: phone || undefined, role: 'customer', emailVerified: true, lastLoginAt: new Date() });
+      isNew = true;
+    }
+  }
+  user.email = email;
+  user.emailVerified = true;
+  user.lastLoginAt = new Date();
+  if (name && !user.name) user.name = name;
+  await user.save();
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'email_otp', true, req);
+  sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Email verified', {
+    isNewUser: isNew, user: publicUser(user), ...tokens,
+  });
+});
