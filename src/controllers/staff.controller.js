@@ -28,14 +28,21 @@ exports.list = asyncHandler(async (req, res) => {
 // POST /api/v1/staff  (owner)
 // If a phone is given, we find-or-create a linked User account with role
 // 'staff' so the stylist can log into the partner app and receive
-// bookings, chat and calls.
+// bookings, chat and calls. `linkSelf: true` is a special case — the owner
+// adding THEMSELVES as a bookable stylist (Settings toggle) — we link
+// straight to req.user._id since they're already authenticated, no phone
+// lookup needed (covers owners with no phone, e.g. Google/email-only accounts).
 exports.create = asyncHandler(async (req, res) => {
-  const { salon, name, phone } = req.body;
+  const { salon, name, phone, linkSelf } = req.body;
   if (!salon || !name) throw ApiError.badRequest('salon and name are required');
   await assertOwnsSalon(req.user, salon);
 
   let userId;
-  if (phone) {
+  if (linkSelf) {
+    userId = req.user._id;
+    // keep the owner's own role/roles untouched — this is a booking-list
+    // link, not a login-role change (see resolveLoginRole in auth.controller.js)
+  } else if (phone) {
     if (!/^[6-9]\d{9}$/.test(phone)) throw ApiError.badRequest('Enter a valid mobile number');
     let staffUser = await User.findOne({ phone });
     if (!staffUser) {
