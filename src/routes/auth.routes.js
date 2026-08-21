@@ -11,6 +11,10 @@ const phoneRule = body('phone').matches(/^[6-9]\d{9}$/).withMessage('Enter a val
 
 router.post('/send-otp', authLimiter, [phoneRule], validate, ctrl.sendOtp);
 router.post('/verify-otp', authLimiter, [phoneRule, body('otp').isLength({ min: 4, max: 6 })], validate, ctrl.verifyOtp);
+// Firebase Phone Auth — client verifies OTP via Firebase's own SMS, sends us the ID token
+router.post('/firebase-login', authLimiter, [body('idToken').notEmpty()], validate, ctrl.firebaseLogin);
+// Google Sign-In — client verifies via Google's own SDK, sends us the ID token
+router.post('/google-login', authLimiter, [body('idToken').notEmpty()], validate, ctrl.googleLogin);
 // login accepts phone OR email + password (validation done in controller)
 router.post('/login', authLimiter, [body('password').notEmpty()], validate, ctrl.login);
 router.post('/forgot-password', authLimiter, [phoneRule], validate, ctrl.forgotPassword);

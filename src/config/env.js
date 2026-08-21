@@ -75,6 +75,15 @@ const config = {
     templateId: process.env.MSG91_TEMPLATE_ID,
   },
 
+  // Twilio Verify — preferred SMS-OTP provider (no billing-plan gate like
+  // Firebase Phone Auth; pay-per-SMS with a free trial credit). Falls back
+  // to MSG91, then to the dev console-log OTP if neither is configured.
+  twilio: {
+    accountSid: process.env.TWILIO_ACCOUNT_SID,
+    authToken: process.env.TWILIO_AUTH_TOKEN,
+    verifyServiceSid: process.env.TWILIO_VERIFY_SERVICE_SID,
+  },
+
   razorpay: {
     keyId: process.env.RAZORPAY_KEY_ID,
     secret: process.env.RAZORPAY_SECRET,
@@ -94,6 +103,9 @@ const config = {
   },
 
   googleMapsKey: process.env.GOOGLE_MAPS_API_KEY,
+
+  // Google Sign-In — accepted OAuth client IDs (Android + Web), comma-separated
+  googleClientIds: (process.env.GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
 
   agora: {
     appId: process.env.AGORA_APP_ID,

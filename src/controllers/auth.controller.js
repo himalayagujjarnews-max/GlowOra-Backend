@@ -16,6 +16,10 @@ const User = require('../models/User');
 const LoginHistory = require('../models/LoginHistory');
 const config = require('../config/env');
 const { notifyUser } = require('../services/notification.service');
+const { admin: firebaseAdmin, enabled: firebaseEnabled } = require('../config/firebase');
+const { OAuth2Client } = require('google-auth-library');
+
+const googleClient = config.googleClientIds.length ? new OAuth2Client() : null;
 
 function publicUser(u) {
   return {
@@ -77,7 +81,7 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
   const { phone, otp, name, role, referralCode } = req.body;
   if (!phone || !otp) throw ApiError.badRequest('Phone and OTP are required');
 
-  const result = await verifyOtp(phone, otp);
+  const result = await verifyOtp(phone, otp, { isPhone: true });
   if (!result.ok) {
     const map = {
       too_many_attempts: 'Too many incorrect attempts. Request a new code.',
@@ -135,6 +139,134 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
 
   const tokens = await sessionService.createSession(user, reqCtx(req));
   await logLogin(user, 'otp', true, req);
+  sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Logged in successfully', {
+    isNewUser: isNew, user: publicUser(user), ...tokens,
+  });
+});
+
+// POST /auth/firebase-login  { idToken, name?, role?, referralCode? }
+// Phone login/signup via Firebase Phone Auth (client verifies OTP with Firebase's
+// own SMS, sends us the resulting ID token; we just verify it server-side and
+// issue our own GlowOra session — mirrors verifyOtp's user-lookup/create logic).
+exports.firebaseLogin = asyncHandler(async (req, res) => {
+  const { idToken, name, role, referralCode } = req.body;
+  if (!idToken) throw ApiError.badRequest('idToken is required');
+  if (!firebaseEnabled) throw ApiError.internal('Phone sign-in is not configured on the server');
+
+  let decoded;
+  try {
+    decoded = await firebaseAdmin.auth().verifyIdToken(idToken);
+  } catch (err) {
+    throw ApiError.unauthorized('Invalid or expired sign-in token');
+  }
+
+  const rawPhone = decoded.phone_number; // E.164, e.g. +919876543210
+  if (!rawPhone) throw ApiError.badRequest('No phone number on this sign-in token');
+  const phone = rawPhone.replace(/^\+91/, '');
+  if (!/^[6-9]\d{9}$/.test(phone)) throw ApiError.badRequest('Unsupported phone number');
+
+  let user = await User.findOne({ phone }).select('+twoFactorSecret +twoFactorBackupCodes');
+  let isNew = false;
+  if (!user) {
+    let referredBy;
+    if (referralCode) {
+      const ref = await User.findOne({ referralCode: referralCode.toUpperCase() });
+      if (ref) referredBy = ref._id;
+    }
+    user = await User.create({
+      phone,
+      name: name || undefined,
+      role: role && ['customer', 'owner'].includes(role) ? role : 'customer',
+      phoneVerified: true,
+      referredBy,
+      lastLoginAt: new Date(),
+    });
+    isNew = true;
+
+    if (referredBy) {
+      await User.findByIdAndUpdate(referredBy, { $inc: { walletBalance: config.referralBonus } });
+      notifyUser(referredBy, {
+        title: 'Referral bonus! 🎉',
+        body: `You earned ₹${config.referralBonus} because ${name || 'a friend'} joined GlowOra.`,
+        type: 'promo',
+      });
+    }
+  } else {
+    user.phoneVerified = true;
+    user.lastLoginAt = new Date();
+    if (name && !user.name) user.name = name;
+    await user.save();
+  }
+
+  if (user.twoFactorEnabled) {
+    if (!req.body.twoFactorCode) {
+      return sendResponse(res, 200, 'Two-factor code required', { twoFactorRequired: true, phone });
+    }
+    if (!(await verifyTwoFactor(user, req.body.twoFactorCode))) {
+      await logLogin(user, '2fa', false, req, 'invalid_2fa');
+      throw ApiError.unauthorized('Invalid two-factor code');
+    }
+  }
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'firebase_phone', true, req);
+  sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Logged in successfully', {
+    isNewUser: isNew, user: publicUser(user), ...tokens,
+  });
+});
+
+// POST /auth/google-login  { idToken, role? }
+// Google Sign-In — client gets an ID token from @react-native-google-signin/google-signin;
+// we verify it against our registered OAuth client IDs and issue our own GlowOra session.
+exports.googleLogin = asyncHandler(async (req, res) => {
+  const { idToken, role } = req.body;
+  if (!idToken) throw ApiError.badRequest('idToken is required');
+  if (!googleClient) throw ApiError.internal('Google sign-in is not configured on the server');
+
+  let payload;
+  try {
+    const ticket = await googleClient.verifyIdToken({ idToken, audience: config.googleClientIds });
+    payload = ticket.getPayload();
+  } catch (err) {
+    throw ApiError.unauthorized('Invalid or expired Google sign-in token');
+  }
+
+  const email = String(payload.email || '').trim().toLowerCase();
+  if (!email) throw ApiError.badRequest('No email on this Google account');
+  if (payload.email_verified === false) throw ApiError.unauthorized('Google email is not verified');
+
+  let user = await User.findOne({ email }).select('+twoFactorSecret +twoFactorBackupCodes');
+  let isNew = false;
+  if (!user) {
+    user = await User.create({
+      email,
+      name: payload.name || undefined,
+      avatar: payload.picture || undefined,
+      role: role && ['customer', 'owner'].includes(role) ? role : 'customer',
+      emailVerified: true,
+      lastLoginAt: new Date(),
+    });
+    isNew = true;
+  } else {
+    user.emailVerified = true;
+    user.lastLoginAt = new Date();
+    if (payload.name && !user.name) user.name = payload.name;
+    if (payload.picture && !user.avatar) user.avatar = payload.picture;
+    await user.save();
+  }
+
+  if (user.twoFactorEnabled) {
+    if (!req.body.twoFactorCode) {
+      return sendResponse(res, 200, 'Two-factor code required', { twoFactorRequired: true, email });
+    }
+    if (!(await verifyTwoFactor(user, req.body.twoFactorCode))) {
+      await logLogin(user, '2fa', false, req, 'invalid_2fa');
+      throw ApiError.unauthorized('Invalid two-factor code');
+    }
+  }
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'google', true, req);
   sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Logged in successfully', {
     isNewUser: isNew, user: publicUser(user), ...tokens,
   });
@@ -217,7 +349,7 @@ exports.resetPassword = asyncHandler(async (req, res) => {
   const { phone, otp, password } = req.body;
   if (!phone || !otp || !password) throw ApiError.badRequest('phone, otp and password are required');
   if (!isStrong(password)) throw ApiError.badRequest('Password must be 8+ chars with letters and numbers');
-  const result = await verifyOtp(phone, otp);
+  const result = await verifyOtp(phone, otp, { isPhone: true });
   if (!result.ok) throw ApiError.badRequest('Invalid or expired code');
   const user = await User.findOne({ phone }).select('+password');
   if (!user) throw ApiError.notFound('Account not found');
