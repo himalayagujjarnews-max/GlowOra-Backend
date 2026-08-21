@@ -23,7 +23,7 @@ const googleClient = config.googleClientIds.length ? new OAuth2Client() : null;
 
 function publicUser(u) {
   return {
-    id: u._id, name: u.name, phone: u.phone, email: u.email, role: u.role,
+    id: u._id, name: u.name, phone: u.phone, email: u.email, role: u.role, roles: u.roles,
     avatar: u.avatar, city: u.city, walletBalance: u.walletBalance,
     glowPoints: u.glowPoints, referralCode: u.referralCode,
     gender: u.gender, dob: u.dob, emailVerified: u.emailVerified,
@@ -34,6 +34,37 @@ function publicUser(u) {
 
 function reqCtx(req) {
   return { ip: req.ip, userAgent: req.headers['user-agent'] };
+}
+
+/**
+ * One identity (phone / email / Google account) can hold several roles at
+ * once — e.g. the same person can be a customer AND a salon owner. `role` is
+ * whichever one is "active" for the app you just logged into; `roles` is the
+ * full set this identity has ever unlocked.
+ *
+ * - 'customer' is always available to anyone (no gatekeeping).
+ * - 'owner' can be self-granted the first time someone logs into the partner
+ *   app with role='owner' — this is the "become a partner" flow.
+ * - 'staff' and 'admin' are NEVER self-granted here — those can only be
+ *   added by an owner (staff) or seeded/promoted directly (admin). If the
+ *   requested role isn't already unlocked, `role` is left untouched, and the
+ *   caller's existing "not a partner" guard correctly blocks the login.
+ *
+ * Mutates `user.role`/`user.roles` in place; caller is responsible for saving.
+ */
+function resolveLoginRole(user, requestedRole) {
+  if (!requestedRole || !['customer', 'owner', 'staff', 'admin'].includes(requestedRole)) return;
+  if (!user.roles || !user.roles.length) user.roles = [user.role];
+
+  if (user.roles.includes(requestedRole)) {
+    user.role = requestedRole; // already unlocked — just switch active context
+    return;
+  }
+  if (requestedRole === 'customer' || requestedRole === 'owner') {
+    user.roles.push(requestedRole); // self-service unlock
+    user.role = requestedRole;
+  }
+  // 'staff' / 'admin': not unlocked and not self-grantable — role stays as-is.
 }
 
 async function logLogin(user, method, success, req, reason) {
@@ -123,6 +154,7 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
     user.phoneVerified = true;
     user.lastLoginAt = new Date();
     if (name && !user.name) user.name = name;
+    resolveLoginRole(user, role);
     await user.save();
   }
 
@@ -195,6 +227,7 @@ exports.firebaseLogin = asyncHandler(async (req, res) => {
     user.phoneVerified = true;
     user.lastLoginAt = new Date();
     if (name && !user.name) user.name = name;
+    resolveLoginRole(user, role);
     await user.save();
   }
 
@@ -252,6 +285,7 @@ exports.googleLogin = asyncHandler(async (req, res) => {
     user.lastLoginAt = new Date();
     if (payload.name && !user.name) user.name = payload.name;
     if (payload.picture && !user.avatar) user.avatar = payload.picture;
+    resolveLoginRole(user, role);
     await user.save();
   }
 

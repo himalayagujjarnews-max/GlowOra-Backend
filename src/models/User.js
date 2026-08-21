@@ -27,11 +27,23 @@ const userSchema = new mongoose.Schema(
     password: { type: String, select: false }, // hashed; for owner/admin login
     gender: { type: String, enum: ['male', 'female', 'other'] },
     dob: { type: Date },
+    // `role` = the ACTIVE role for the current app/session context (drives every
+    // permission check throughout the backend — unchanged behaviour).
     role: {
       type: String,
       enum: ['customer', 'owner', 'staff', 'admin'],
       default: 'customer',
       index: true,
+    },
+    // `roles` = every role this identity has ever unlocked. One phone/email/
+    // Google account can be a customer AND a salon owner AND staff at the same
+    // time — logging into a different app just switches which role is
+    // "active" (see resolveLoginRole in auth.controller.js), it never creates
+    // a second account. 'staff' and 'admin' can only ever be added here by an
+    // owner/admin explicitly — never granted via self-service login.
+    roles: {
+      type: [{ type: String, enum: ['customer', 'owner', 'staff', 'admin'] }],
+      default: ['customer'],
     },
     avatar: { type: String },
     avatarPublicId: { type: String },
@@ -86,6 +98,10 @@ userSchema.pre('save', function (next) {
   if (!this.referralCode) {
     this.referralCode = `GLOW${this._id.toString().slice(-6).toUpperCase()}`;
   }
+  // Keep `roles` in sync with `role` — covers legacy documents saved before
+  // `roles` existed, and any code path that sets `role` directly.
+  if (!this.roles) this.roles = [];
+  if (this.role && !this.roles.includes(this.role)) this.roles.push(this.role);
   next();
 });
 
