@@ -20,7 +20,10 @@ const salonSchema = new mongoose.Schema(
     images: [{ type: String }],
 
     address: {
-      line: { type: String, required: true },
+      shopNumber: { type: String, trim: true, maxlength: 40 }, // e.g. "SCO 123" / "Shop No. 5"
+      market: { type: String, trim: true, maxlength: 80 },     // market / complex / building name
+      sector: { type: String, trim: true, maxlength: 40 },     // sector / block / area
+      line: { type: String, required: true },                  // free-text street/area line
       city: { type: String, required: true, index: true },
       state: { type: String },
       pincode: { type: String, match: [/^\d{6}$/, 'Enter a valid 6-digit pincode'] },

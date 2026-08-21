@@ -6,6 +6,7 @@ const ApiError = require('../utils/ApiError');
 const sendResponse = require('../utils/ApiResponse');
 const Service = require('../models/Service');
 const Salon = require('../models/Salon');
+const { tryActivateSalon } = require('./salon.controller');
 
 async function assertOwnsSalon(user, salonId) {
   const salon = await Salon.findById(salonId);
@@ -33,7 +34,8 @@ exports.create = asyncHandler(async (req, res) => {
   }
   await assertOwnsSalon(req.user, salon);
   const service = await Service.create(req.body);
-  sendResponse(res, 201, 'Service added', { service });
+  const updatedSalon = await tryActivateSalon(salon);
+  sendResponse(res, 201, 'Service added', { service, salonStatus: updatedSalon?.status });
 });
 
 // PATCH /api/v1/services/:id  (owner)

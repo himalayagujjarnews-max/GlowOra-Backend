@@ -12,6 +12,28 @@ const Staff = require('../models/Staff');
 const ServicePackage = require('../models/ServicePackage');
 const Review = require('../models/Review');
 
+// A salon only goes live (visible to customers) once its profile is actually
+// usable — at least one photo AND at least one service. Until then it stays
+// 'pending' regardless of AUTO_APPROVE_SALONS, so nobody sees an empty shell
+// of a salon. Call this after anything that could complete the profile
+// (photo upload, first service added, salon update).
+async function tryActivateSalon(salonId) {
+  const salon = await Salon.findById(salonId);
+  if (!salon || salon.status !== 'pending') return salon;
+
+  const hasPhoto = Boolean(salon.coverImage) || (salon.images || []).length > 0;
+  const hasService = await Service.exists({ salon: salonId, active: true });
+  if (!hasPhoto || !hasService) return salon;
+
+  const autoApprove = process.env.AUTO_APPROVE_SALONS !== 'false';
+  if (!autoApprove) return salon; // still needs manual admin approval
+
+  salon.status = 'active';
+  await salon.save();
+  return salon;
+}
+exports.tryActivateSalon = tryActivateSalon;
+
 // GET /api/v1/salons/nearby?lng=&lat=&radius=&city=&type=
 // If lng/lat given → geo search within `radius` (default 25km) so salons in
 // nearby cities are included too. Otherwise fall back to the given city, and if
@@ -84,25 +106,27 @@ exports.uploadImages = asyncHandler(async (req, res) => {
   if (!salon.coverImage && urls.length) salon.coverImage = urls[0];
   salon.images.push(...urls);
   await salon.save();
-  sendResponse(res, 200, 'Images uploaded', { images: salon.images });
+  const updated = await tryActivateSalon(salon._id);
+  sendResponse(res, 200, 'Images uploaded', { images: updated.images, salonStatus: updated.status });
 });
 
 // POST /api/v1/salons  (owner registers a salon)
-// AUTO_APPROVE_SALONS=true (default) makes new salons active immediately so they
-// show to customers right away. Set the env to 'false' to require admin approval.
+// Always starts 'pending' — a brand-new salon has no photos/services yet, so
+// there's nothing worth showing customers. It flips to 'active' automatically
+// (see tryActivateSalon) once the owner adds at least one photo and one
+// service — no admin wait, but also no empty salons in search results.
 exports.create = asyncHandler(async (req, res) => {
   const { name, type, description, address, location, offersHomeService, openTime, closeTime } = req.body;
   if (!name || !type || !address?.city || !location?.coordinates) {
     throw ApiError.badRequest('name, type, address.city and location.coordinates are required');
   }
-  const autoApprove = process.env.AUTO_APPROVE_SALONS !== 'false';
   const salon = await Salon.create({
     owner: req.user._id,
     name, type, description, address, location,
     offersHomeService, openTime, closeTime,
-    status: autoApprove ? 'active' : 'pending',
+    status: 'pending',
   });
-  sendResponse(res, 201, autoApprove ? 'Salon created and live' : 'Salon submitted for approval', { salon });
+  sendResponse(res, 201, 'Salon created — add photos and a service to go live', { salon });
 });
 
 // GET /api/v1/salons/mine  (owner's salons)
