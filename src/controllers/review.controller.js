@@ -17,9 +17,11 @@ exports.listForSalon = asyncHandler(async (req, res) => {
   sendResponse(res, 200, 'Reviews', { count: reviews.length, reviews });
 });
 
-// POST /api/v1/reviews  { bookingId, rating, comment }  (customer)
+// POST /api/v1/reviews  { bookingId, rating, staffRating?, comment }  (customer)
+// `rating` rates the salon; `staffRating` separately rates the assigned
+// stylist (only relevant if the booking had one — otherwise omit it).
 exports.create = asyncHandler(async (req, res) => {
-  const { bookingId, rating, comment } = req.body;
+  const { bookingId, rating, staffRating, comment } = req.body;
   if (!bookingId || !rating) throw ApiError.badRequest('bookingId and rating are required');
 
   const booking = await Booking.findById(bookingId);
@@ -33,7 +35,9 @@ exports.create = asyncHandler(async (req, res) => {
     customer: req.user._id,
     salon: booking.salon,
     staff: booking.staff,
-    rating, comment,
+    rating,
+    staffRating: booking.staff && staffRating ? staffRating : undefined,
+    comment,
   });
 
   booking.ratedByCustomer = true;

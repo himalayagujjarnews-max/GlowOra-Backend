@@ -59,6 +59,7 @@ const bookingSchema = new mongoose.Schema(
     cancelReason: { type: String },
     completedAt: { type: Date },
     ratedByCustomer: { type: Boolean, default: false },
+    ratedBySalon: { type: Boolean, default: false }, // owner/staff rated the customer
     paidOut: { type: Boolean, default: false }, // salon payout settled
     reminderSent: { type: Boolean, default: false }, // 1-hour reminder sent
     glowPointsRedeemed: { type: Number, default: 0 }, // loyalty points used

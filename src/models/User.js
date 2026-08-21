@@ -81,6 +81,11 @@ const userSchema = new mongoose.Schema(
     dataExportRequestedAt: { type: Date },
     anonymizedAt: { type: Date },
 
+    // salons rate customers (reliability/behaviour) after completed bookings —
+    // separate from the salon's own rating; helps salons vet home-service requests
+    customerRating: { type: Number, default: 0, min: 0, max: 5 },
+    customerRatingCount: { type: Number, default: 0 },
+
     lastLoginAt: { type: Date },
     notificationsEnabled: { type: Boolean, default: true },
     language: { type: String, enum: ['hi', 'en', 'pa'], default: 'en' },

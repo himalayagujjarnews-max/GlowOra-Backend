@@ -67,6 +67,15 @@ function resolveLoginRole(user, requestedRole) {
   // 'staff' / 'admin': not unlocked and not self-grantable — role stays as-is.
 }
 
+/** Fired once, right after a brand-new account is created (any login method). */
+function sendWelcomeNotification(user) {
+  notifyUser(user._id, {
+    title: `Welcome to GlowOra, ${user.name || 'there'}! ✨`,
+    body: 'Discover top-rated salons near you and book your first appointment in seconds.',
+    type: 'system',
+  });
+}
+
 async function logLogin(user, method, success, req, reason) {
   try {
     await LoginHistory.create({
@@ -140,6 +149,7 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
       lastLoginAt: new Date(),
     });
     isNew = true;
+    sendWelcomeNotification(user);
 
     // reward referrer
     if (referredBy) {
@@ -214,6 +224,7 @@ exports.firebaseLogin = asyncHandler(async (req, res) => {
       lastLoginAt: new Date(),
     });
     isNew = true;
+    sendWelcomeNotification(user);
 
     if (referredBy) {
       await User.findByIdAndUpdate(referredBy, { $inc: { walletBalance: config.referralBonus } });
@@ -280,6 +291,7 @@ exports.googleLogin = asyncHandler(async (req, res) => {
       lastLoginAt: new Date(),
     });
     isNew = true;
+    sendWelcomeNotification(user);
   } else {
     user.emailVerified = true;
     user.lastLoginAt = new Date();
@@ -464,6 +476,7 @@ exports.verifyEmail = asyncHandler(async (req, res) => {
     if (!user) {
       user = await User.create({ email, name: name || undefined, phone: phone || undefined, role: 'customer', emailVerified: true, lastLoginAt: new Date() });
       isNew = true;
+      sendWelcomeNotification(user);
     }
   }
   user.email = email;

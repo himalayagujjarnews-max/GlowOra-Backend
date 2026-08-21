@@ -130,8 +130,16 @@ exports.create = asyncHandler(async (req, res) => {
 });
 
 // GET /api/v1/salons/mine  (owner's salons)
+// Also self-heals: catches salons that already meet the go-live criteria
+// (e.g. photos/services were added before this activation check existed, or
+// before an admin-approval-only deploy) but never got flipped to 'active'.
 exports.getMine = asyncHandler(async (req, res) => {
-  const salons = await Salon.find({ owner: req.user._id });
+  let salons = await Salon.find({ owner: req.user._id });
+  const pending = salons.filter((s) => s.status === 'pending');
+  if (pending.length) {
+    await Promise.all(pending.map((s) => tryActivateSalon(s._id)));
+    salons = await Salon.find({ owner: req.user._id });
+  }
   sendResponse(res, 200, 'Your salons', { count: salons.length, salons });
 });
 

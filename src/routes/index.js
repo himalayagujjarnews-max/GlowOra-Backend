@@ -16,6 +16,7 @@ const paymentRoutes = require('./payment.routes');
 const walletRoutes = require('./wallet.routes');
 const couponRoutes = require('./coupon.routes');
 const reviewRoutes = require('./review.routes');
+const customerReviewRoutes = require('./customerReview.routes');
 const favoriteRoutes = require('./favorite.routes');
 const notificationRoutes = require('./notification.routes');
 const chatRoutes = require('./chat.routes');
@@ -53,7 +54,7 @@ router.get('/', (req, res) => {
       'auth', '2fa', 'sessions', 'privacy', 'users', 'addresses', 'family',
       'salons', 'services', 'packages', 'staff', 'attendance', 'slots', 'bookings',
       'payments', 'wallet', 'coupons', 'offers', 'subscriptions', 'vouchers',
-      'reviews', 'product-reviews', 'favorites', 'notifications', 'chat', 'calls',
+      'reviews', 'customer-reviews', 'product-reviews', 'favorites', 'notifications', 'chat', 'calls',
       'analytics', 'cities', 'banners', 'support', 'payouts', 'admin', 'shop',
       'waitlist', 'recurring', 'inventory', 'campaigns', 'ai',
     ],
@@ -74,6 +75,7 @@ router.use('/payments', paymentRoutes);
 router.use('/wallet', walletRoutes);
 router.use('/coupons', couponRoutes);
 router.use('/reviews', reviewRoutes);
+router.use('/customer-reviews', customerReviewRoutes);
 router.use('/favorites', favoriteRoutes);
 router.use('/notifications', notificationRoutes);
 router.use('/chat', chatRoutes);
