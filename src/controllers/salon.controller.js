@@ -19,17 +19,23 @@ const Review = require('../models/Review');
 // (photo upload, first service added, salon update).
 async function tryActivateSalon(salonId) {
   const salon = await Salon.findById(salonId);
-  if (!salon || salon.status !== 'pending') return salon;
+  if (!salon) { console.log('[tryActivateSalon]', salonId, 'no salon found'); return salon; }
+  if (salon.status !== 'pending') {
+    console.log('[tryActivateSalon]', salon._id.toString(), 'status is', salon.status, '- skipping');
+    return salon;
+  }
 
   const hasPhoto = Boolean(salon.coverImage) || (salon.images || []).length > 0;
   const hasService = await Service.exists({ salon: salonId, active: true });
+  console.log('[tryActivateSalon]', salon._id.toString(), { hasPhoto, coverImage: salon.coverImage, imagesLen: (salon.images || []).length, hasService: Boolean(hasService), autoApproveEnv: process.env.AUTO_APPROVE_SALONS });
   if (!hasPhoto || !hasService) return salon;
 
   const autoApprove = process.env.AUTO_APPROVE_SALONS !== 'false';
-  if (!autoApprove) return salon; // still needs manual admin approval
+  if (!autoApprove) { console.log('[tryActivateSalon]', salon._id.toString(), 'auto-approve disabled, needs manual approval'); return salon; }
 
   salon.status = 'active';
   await salon.save();
+  console.log('[tryActivateSalon]', salon._id.toString(), 'ACTIVATED');
   return salon;
 }
 exports.tryActivateSalon = tryActivateSalon;
