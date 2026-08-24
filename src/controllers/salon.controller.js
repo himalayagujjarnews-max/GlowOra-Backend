@@ -120,6 +120,14 @@ exports.create = asyncHandler(async (req, res) => {
   if (!name || !type || !address?.city || !location?.coordinates) {
     throw ApiError.badRequest('name, type, address.city and location.coordinates are required');
   }
+  // One salon per owner. Without this, repeated taps on "create salon" (or
+  // testing) silently create duplicates — since every other screen assumes
+  // a single salon (`salons[0]`), the wrong (often incomplete) one can end
+  // up "winning" and the real one never appears to go live.
+  const existing = await Salon.findOne({ owner: req.user._id, status: { $ne: 'rejected' } });
+  if (existing) {
+    throw ApiError.badRequest('You already have a salon registered. Edit your existing salon instead of creating a new one.');
+  }
   const salon = await Salon.create({
     owner: req.user._id,
     name, type, description, address, location,
@@ -134,11 +142,16 @@ exports.create = asyncHandler(async (req, res) => {
 // (e.g. photos/services were added before this activation check existed, or
 // before an admin-approval-only deploy) but never got flipped to 'active'.
 exports.getMine = asyncHandler(async (req, res) => {
-  let salons = await Salon.find({ owner: req.user._id });
+  // Sorted newest-first: the app (and mobile authStore) always takes
+  // salons[0] as "the" salon. If duplicate salons exist from earlier
+  // testing, this ensures the most recently created one (almost always the
+  // real/complete one) is what's shown, not whichever old doc Mongo
+  // happens to return first.
+  let salons = await Salon.find({ owner: req.user._id }).sort({ createdAt: -1 });
   const pending = salons.filter((s) => s.status === 'pending');
   if (pending.length) {
     await Promise.all(pending.map((s) => tryActivateSalon(s._id)));
-    salons = await Salon.find({ owner: req.user._id });
+    salons = await Salon.find({ owner: req.user._id }).sort({ createdAt: -1 });
   }
   sendResponse(res, 200, 'Your salons', { count: salons.length, salons });
 });
