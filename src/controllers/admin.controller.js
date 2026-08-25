@@ -8,6 +8,7 @@ const Salon = require('../models/Salon');
 const Booking = require('../models/Booking');
 const Payment = require('../models/Payment');
 const AuditLog = require('../models/AuditLog');
+const { escapeRegex } = require('../utils/helpers');
 const LoginHistory = require('../models/LoginHistory');
 const { getPagination, buildMeta } = require('../utils/pagination');
 const { broadcast } = require('../services/notification.service');
@@ -62,7 +63,7 @@ exports.bookingsByCity = asyncHandler(async (req, res) => {
 exports.auditLogs = asyncHandler(async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const filter = {};
-  if (req.query.action) filter.action = new RegExp(req.query.action, 'i');
+  if (req.query.action) filter.action = new RegExp(escapeRegex(req.query.action), 'i');
   if (req.query.actor) filter.actor = req.query.actor;
   const [logs, total] = await Promise.all([
     AuditLog.find(filter).populate('actor', 'name phone role').sort({ createdAt: -1 }).skip(skip).limit(limit),

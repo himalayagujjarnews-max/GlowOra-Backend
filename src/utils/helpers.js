@@ -53,6 +53,19 @@ function money(n) {
 }
 
 /**
+ * Escape regex metacharacters in user-supplied search input before building
+ * a `new RegExp(...)` from it. Without this, several public/admin search
+ * endpoints (salon name/city search, admin user search, audit log search)
+ * pass raw query strings straight into RegExp — a crafted pathological
+ * pattern can trigger catastrophic backtracking (ReDoS) and hang the Mongo
+ * query executor, and on the PUBLIC unauthenticated salon search endpoint
+ * that's exploitable by anyone.
+ */
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Commission rate for a booking, per documentation.
  * Priority: salon subscription plan tier, then payment mode.
  *   Plans:   free 15% · basic 12% · pro 10%
@@ -67,4 +80,4 @@ function commissionPercentFor(salon, paymentMode, defaults) {
   return rate;
 }
 
-module.exports = { addMinutes, genCode, ymd, localYmd, localTime, clamp, money, commissionPercentFor };
+module.exports = { addMinutes, genCode, ymd, localYmd, localTime, clamp, money, commissionPercentFor, escapeRegex };

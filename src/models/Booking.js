@@ -9,7 +9,9 @@ const bookingSchema = new mongoose.Schema(
     bookingCode: { type: String, unique: true, index: true },
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     salon: { type: mongoose.Schema.Types.ObjectId, ref: 'Salon', required: true, index: true },
-    staff: { type: mongoose.Schema.Types.ObjectId, ref: 'Staff', required: true },
+    // Not required — booking.controller.js's create() allows `staff: null`
+    // when the salon has zero active stylists yet.
+    staff: { type: mongoose.Schema.Types.ObjectId, ref: 'Staff' },
     services: [
       {
         service: { type: mongoose.Schema.Types.ObjectId, ref: 'Service' },
@@ -41,6 +43,7 @@ const bookingSchema = new mongoose.Schema(
     total: { type: Number, required: true },
     commission: { type: Number, default: 0 }, // platform cut
     salonPayout: { type: Number, default: 0 },
+    commissionAmount: { type: Number, default: 0 }, // assigned staff's cut, set at completion (Staff.commissionPercent)
 
     paymentMode: { type: String, enum: ['token', 'full_online', 'at_salon', 'wallet'], required: true },
     paymentStatus: { type: String, enum: ['unpaid', 'token_paid', 'paid', 'refunded'], default: 'unpaid' },

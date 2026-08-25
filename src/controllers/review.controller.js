@@ -7,6 +7,7 @@ const sendResponse = require('../utils/ApiResponse');
 const Review = require('../models/Review');
 const Booking = require('../models/Booking');
 const Salon = require('../models/Salon');
+const { uploadImage } = require('../config/cloudinary');
 
 // GET /api/v1/reviews?salon=
 exports.listForSalon = asyncHandler(async (req, res) => {
@@ -44,6 +45,21 @@ exports.create = asyncHandler(async (req, res) => {
   await booking.save();
 
   sendResponse(res, 201, 'Thanks for your review', { review });
+});
+
+// POST /api/v1/reviews/:id/images   (customer, multipart: images[], max 3)
+// Called AFTER the review is created — mirrors salon.controller.js's
+// uploadImages (same cloudinary helper + multer array middleware).
+exports.uploadImages = asyncHandler(async (req, res) => {
+  const review = await Review.findById(req.params.id);
+  if (!review) throw ApiError.notFound('Review not found');
+  if (review.customer.toString() !== req.user._id.toString()) throw ApiError.forbidden('Not your review');
+  if (!req.files || !req.files.length) throw ApiError.badRequest('No images uploaded');
+  const uploaded = await Promise.all(req.files.map((f) => uploadImage(f.buffer, 'glowora/reviews')));
+  const urls = uploaded.map((u) => u.url);
+  review.images.push(...urls);
+  await review.save();
+  sendResponse(res, 200, 'Images uploaded', { images: review.images });
 });
 
 // PATCH /api/v1/reviews/:id/reply  { reply }  (owner)

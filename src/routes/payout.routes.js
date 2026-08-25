@@ -6,9 +6,10 @@ const router = express.Router();
 
 router.use(protect);
 
-router.get('/mine', restrictTo('owner', 'admin'), ctrl.mine);
+router.get('/mine', restrictTo('owner', 'staff', 'admin'), ctrl.mine);
 router.get('/pending', restrictTo('admin'), ctrl.pending);
 router.get('/', restrictTo('admin'), ctrl.adminList);
 router.post('/', restrictTo('admin'), ctrl.create);
+router.patch('/:id', restrictTo('admin'), ctrl.updateStatus);
 
 module.exports = router;

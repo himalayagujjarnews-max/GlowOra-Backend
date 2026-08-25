@@ -47,15 +47,31 @@ const salonSchema = new mongoose.Schema(
     breakEnd: { type: String },
     maxPerSlot: { type: Number, default: 1 },
 
-    // payout / compliance (account number & PAN encrypted at rest)
+    // payout / compliance (account number & PAN encrypted at rest).
+    // select: false — never returned unless a query explicitly opts in with
+    // .select('+bankDetails +panNumber'), matching the pattern used on
+    // User.js's password/OTP fields. Without this, any query that doesn't
+    // deliberately exclude them (e.g. the public getById detail endpoint)
+    // leaks bank/PAN data to whoever calls it.
     bankDetails: {
-      accountName: String,
-      accountNumber: { type: String, set: enc.set, get: enc.get },
-      ifsc: String,
-      upiId: String,
+      accountName: { type: String, select: false },
+      accountNumber: { type: String, set: enc.set, get: enc.get, select: false },
+      ifsc: { type: String, select: false },
+      upiId: { type: String, select: false },
     },
-    gstNumber: { type: String },
-    panNumber: { type: String, set: enc.set, get: enc.get },
+    gstNumber: { type: String, select: false },
+    panNumber: { type: String, set: enc.set, get: enc.get, select: false },
+    // Set by admin after manually reviewing the bank details above (no real
+    // penny-drop/bank-API verification yet — see partnerWallet.controller.js
+    // for where this gates automated payouts). Only verified accounts are
+    // eligible for the T+1 wallet -> bank settlement job.
+    bankVerified: { type: Boolean, default: false },
+
+    // Internal wallet — booking earnings (online-paid) land here first, then
+    // get auto-settled to the bank account next day (see scheduler.service.js
+    // `runWalletSettlement`). Separate from `pendingPayout` (an old, unused
+    // bookkeeping number) and from the customer-side User.walletBalance.
+    walletBalance: { type: Number, default: 0, min: 0 },
 
     // subscription
     subscriptionPlan: { type: String, enum: ['free', 'basic', 'pro'], default: 'free' },

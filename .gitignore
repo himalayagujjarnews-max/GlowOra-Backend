@@ -2,10 +2,15 @@
 node_modules/
 .npm
 
-# Environment
+# Environment — .env-local (hyphen) didn't match any of the dotted patterns
+# below, so it was NOT actually git-ignored despite holding live production
+# secrets (Mongo URI, JWT/encryption secrets, Firebase key, Cloudinary,
+# Agora, Gmail app password). Added explicitly, plus a broader .env* catch-all.
 .env
 .env.local
 .env.*.local
+.env-local
+.env*
 
 # Logs
 logs/

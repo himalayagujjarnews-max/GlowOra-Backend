@@ -62,9 +62,13 @@ exports.verifyTopup = asyncHandler(async (req, res) => {
   payment.razorpaySignature = razorpaySignature;
   await payment.save();
 
-  const user = await User.findById(req.user._id);
-  user.walletBalance += payment.amount; // trusted, server-recorded amount
-  await user.save();
+  // Atomic $inc, not a read-then-write — two concurrent verify calls (e.g. a
+  // retried webhook + the client's own poll) can't both add the amount.
+  const user = await User.findByIdAndUpdate(
+    req.user._id,
+    { $inc: { walletBalance: payment.amount } },
+    { new: true }
+  );
   await WalletTransaction.create({
     user: user._id, type: 'credit', amount: payment.amount, balanceAfter: user.walletBalance,
     source: 'topup', reference: payment._id, description: 'Wallet top-up',
@@ -73,21 +77,37 @@ exports.verifyTopup = asyncHandler(async (req, res) => {
 });
 
 module.exports.creditWallet = async function creditWallet(userId, amount, source, description, reference) {
-  const user = await User.findById(userId);
+  // Atomic — see debitWallet's comment for why this matters.
+  const user = await User.findByIdAndUpdate(userId, { $inc: { walletBalance: amount } }, { new: true });
   if (!user) return null;
-  user.walletBalance += amount;
-  await user.save();
   await WalletTransaction.create({ user: userId, type: 'credit', amount, balanceAfter: user.walletBalance, source, description, reference });
   return user.walletBalance;
 };
 
 // Debit wallet — throws if insufficient balance. Returns new balance.
+//
+// This used to be read-balance -> check -> write-balance, three separate
+// steps with no lock between them. Two concurrent debits (e.g. a booking
+// paid from wallet plus a near-simultaneous retry, or two tabs) could both
+// read the same starting balance, both pass the `>= amount` check, and both
+// write — draining the wallet below zero. Fixed with a single atomic
+// `findOneAndUpdate` whose FILTER itself enforces the balance guard
+// (`walletBalance: { $gte: amount }`), so only one of two racing requests
+// can ever match and decrement; the other gets a null result deterministically.
 module.exports.debitWallet = async function debitWallet(userId, amount, source, description, reference) {
-  const user = await User.findById(userId);
-  if (!user) throw ApiError.notFound('User not found');
-  if (user.walletBalance < amount) throw ApiError.badRequest('Insufficient wallet balance');
-  user.walletBalance -= amount;
-  await user.save();
+  const user = await User.findOneAndUpdate(
+    { _id: userId, walletBalance: { $gte: amount } },
+    { $inc: { walletBalance: -amount } },
+    { new: true }
+  );
+  if (!user) {
+    // Either the user doesn't exist, or the balance guard failed — check
+    // which, purely to give an accurate error message (the update itself
+    // already safely did nothing in either case).
+    const exists = await User.exists({ _id: userId });
+    if (!exists) throw ApiError.notFound('User not found');
+    throw ApiError.badRequest('Insufficient wallet balance');
+  }
   await WalletTransaction.create({ user: userId, type: 'debit', amount, balanceAfter: user.walletBalance, source, description, reference });
   return user.walletBalance;
 };

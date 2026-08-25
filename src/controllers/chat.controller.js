@@ -29,7 +29,18 @@ exports.openConversation = asyncHandler(async (req, res) => {
   const salon = await Salon.findById(booking.salon);
   const isCustomer = booking.customer.toString() === req.user._id.toString();
   const isOwner = salon && salon.owner.toString() === req.user._id.toString();
-  if (!isCustomer && !isOwner && req.user.role !== 'staff' && req.user.role !== 'admin') {
+  const isAdmin = req.user.role === 'admin';
+  // Checking role alone (`req.user.role === 'staff'`) let ANY staff account
+  // platform-wide open a conversation for ANY booking, not just one they're
+  // actually assigned to — an IDOR that leaked this booking's
+  // customer/staff/salon ids to unrelated staff. Verify they're the staff
+  // member actually linked to this specific booking instead.
+  let isAssignedStaff = false;
+  if (!isCustomer && !isOwner && !isAdmin && req.user.role === 'staff') {
+    const staffDoc = await Staff.findOne({ _id: booking.staff, user: req.user._id }).select('_id');
+    isAssignedStaff = Boolean(staffDoc);
+  }
+  if (!isCustomer && !isOwner && !isAdmin && !isAssignedStaff) {
     throw ApiError.forbidden('Not allowed');
   }
   if (!booking.communicationUnlocked) {

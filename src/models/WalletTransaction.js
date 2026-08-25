@@ -11,7 +11,7 @@ const walletTxnSchema = new mongoose.Schema(
     balanceAfter: { type: Number, required: true },
     source: {
       type: String,
-      enum: ['topup', 'booking', 'refund', 'referral', 'cashback', 'admin_adjust'],
+      enum: ['topup', 'booking', 'refund', 'referral', 'cashback', 'admin_adjust', 'penalty'],
       required: true,
     },
     reference: { type: mongoose.Schema.Types.ObjectId }, // booking/payment id

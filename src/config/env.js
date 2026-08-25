@@ -107,6 +107,12 @@ const config = {
   // Google Sign-In — accepted OAuth client IDs (Android + Web), comma-separated
   googleClientIds: (process.env.GOOGLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
 
+  // Sign in with Apple — accepted audiences, comma-separated (the iOS bundle
+  // IDs of both apps, e.g. life.glowora.app,life.glowora.partner). No private
+  // key needed — we only verify the identityToken Apple already signed,
+  // never mint our own Apple-side tokens.
+  appleClientIds: (process.env.APPLE_CLIENT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+
   agora: {
     appId: process.env.AGORA_APP_ID,
     appCertificate: process.env.AGORA_APP_CERTIFICATE,
@@ -135,6 +141,12 @@ const config = {
   onlineDiscountPercent: parseFloat(process.env.ONLINE_DISCOUNT_PERCENT) || 5,
   loyaltyPointsPerRupee: parseFloat(process.env.LOYALTY_POINTS_PER_RUPEE) || 0.1,
   referralBonus: parseInt(process.env.REFERRAL_BONUS, 10) || 50,
+  // No-show / very-late-cancellation penalty — a small flat amount debited
+  // from the customer's wallet (see booking.controller.js cancel/updateStatus).
+  // Best-effort: if the wallet balance can't cover it, the penalty is simply
+  // skipped rather than blocking the cancel/no-show flow.
+  noShowPenaltyAmount: parseInt(process.env.NO_SHOW_PENALTY_AMOUNT, 10) || 99,
+  lateCancelWindowHours: parseFloat(process.env.LATE_CANCEL_WINDOW_HOURS) || 2,
 
   otp: {
     length: 4,

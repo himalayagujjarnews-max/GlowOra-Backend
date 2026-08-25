@@ -13,9 +13,12 @@ const Salon = require('../models/Salon');
 const Slot = require('../models/Slot');
 const User = require('../models/User');
 const FamilyMember = require('../models/FamilyMember');
+const PointsLedger = require('../models/PointsLedger'); // Glow Points earn/redeem history
+const AbandonedCart = require('../models/AbandonedCart'); // cleared once a booking actually completes
 const { notifyUser } = require('../services/notification.service');
 const { evaluate: evaluateCoupon } = require('./coupon.controller');
 const { debitWallet, creditWallet } = require('./wallet.controller');
+const { creditSalonWallet } = require('./partnerWallet.controller');
 const { localYmd, localTime, commissionPercentFor } = require('../utils/helpers');
 
 // Simple slot generator between open/close in 30-min steps.
@@ -190,9 +193,22 @@ exports.create = asyncHandler(async (req, res) => {
   await slot.save();
   await Salon.findByIdAndUpdate(salon, { $inc: { bookingCount: 1 } });
 
+  // the booking went through — any pending abandoned-cart reminder for this
+  // user+salon is now moot, so clear it out (best-effort, non-fatal).
+  AbandonedCart.deleteOne({ user: req.user._id, salon }).catch(() => {});
+
   // deduct redeemed loyalty points
   if (glowPointsRedeemed > 0) {
-    await User.findByIdAndUpdate(req.user._id, { $inc: { glowPoints: -glowPointsRedeemed } });
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user._id,
+      { $inc: { glowPoints: -glowPointsRedeemed } },
+      { new: true }
+    ).select('glowPoints');
+    await PointsLedger.create({
+      user: req.user._id, type: 'redeemed', points: glowPointsRedeemed,
+      reason: `Redeemed for discount on booking at ${salonDoc.name}`,
+      booking: booking._id, balanceAfter: updatedUser.glowPoints,
+    });
   }
 
   // consume the coupon now that the booking exists
@@ -272,7 +288,9 @@ exports.updateStatus = asyncHandler(async (req, res) => {
   const valid = ['confirmed', 'in_progress', 'completed', 'no_show'];
   if (!valid.includes(status)) throw ApiError.badRequest('Invalid status');
 
-  const booking = await Booking.findById(req.params.id).populate('salon', 'owner');
+  // salon name is included (not just owner) since it's now used in the
+  // Glow Points ledger reason string below.
+  const booking = await Booking.findById(req.params.id).populate('salon', 'owner name');
   if (!booking) throw ApiError.notFound('Booking not found');
 
   const isOwner = booking.salon.owner.toString() === req.user._id.toString();
@@ -289,6 +307,23 @@ exports.updateStatus = asyncHandler(async (req, res) => {
 
   booking.status = status;
   if (status === 'confirmed') booking.communicationUnlocked = true;
+
+  // No-show penalty — a small flat amount debited from the customer's wallet
+  // when the owner/staff marks a booking as no-show. Best-effort: if the
+  // wallet balance can't cover it, we simply skip the debit rather than
+  // blocking the no-show flow (this is a deterrent, not a hard requirement).
+  if (status === 'no_show') {
+    booking.communicationUnlocked = false;
+    try {
+      await debitWallet(booking.customer, config.noShowPenaltyAmount, 'penalty', `No-show penalty for booking ${booking.bookingCode}`, booking._id);
+      notifyUser(booking.customer, {
+        title: 'No-show penalty applied',
+        body: `₹${config.noShowPenaltyAmount} was deducted from your wallet for missing booking ${booking.bookingCode}.`,
+        type: 'booking', data: { bookingId: booking._id.toString() },
+      });
+    } catch { /* insufficient balance — non-fatal, skip the penalty */ }
+  }
+
   if (status === 'completed') {
     booking.completedAt = new Date();
     booking.communicationUnlocked = false; // lock chat/call after completion
@@ -298,9 +333,51 @@ exports.updateStatus = asyncHandler(async (req, res) => {
       booking.productsUsed = req.body.productsUsed;
     }
 
-    // award loyalty points
-    const pts = Math.round(booking.total * config.loyaltyPointsPerRupee);
-    if (pts > 0) await User.findByIdAndUpdate(booking.customer, { $inc: { glowPoints: pts } });
+    // staff commission owed — flat per-staff rate (Staff.commissionPercent),
+    // purely additive bookkeeping on top of the existing revenue/payout math
+    // above; doesn't affect salonPayout or customer-facing totals.
+    if (booking.staff) {
+      const staffDoc = await Staff.findById(booking.staff).select('commissionPercent');
+      const staffCommissionPercent = staffDoc?.commissionPercent || 0;
+      booking.commissionAmount = Math.round((booking.total * staffCommissionPercent) / 100);
+    }
+
+    // Credit the salon's internal wallet with its net payout — only for
+    // bookings the PLATFORM actually collected online (token/full_online/
+    // wallet paymentMode). `at_salon` bookings are cash-in-hand at the salon
+    // already, so the platform never held that money and there's nothing to
+    // settle. This wallet balance is what auto-transfers to the salon's bank
+    // account next day (see scheduler.service.js `runWalletSettlement`).
+    if (booking.paymentMode !== 'at_salon' && booking.salonPayout > 0) {
+      await creditSalonWallet(
+        booking.salon._id, booking.salonPayout, 'booking_earning',
+        `Booking ${booking.bookingCode} completed`, booking._id
+      );
+    }
+
+    // award loyalty points — tier multiplier is based on the customer's
+    // lifetime spend BEFORE this booking (their current tier), so crossing
+    // a threshold only boosts points starting next booking, not retroactively.
+    const customerBefore = await User.findById(booking.customer).select('totalSpent');
+    const tierBefore = User.getTier(customerBefore?.totalSpent || 0);
+    const tierMultiplier = User.TIER_POINTS_MULTIPLIER[tierBefore] || 1;
+    const pts = Math.round(booking.total * config.loyaltyPointsPerRupee * tierMultiplier);
+    // totalSpent always tracks lifetime spend, even on the rare zero-point booking.
+    if (booking.total > 0) {
+      await User.findByIdAndUpdate(booking.customer, { $inc: { totalSpent: booking.total } });
+    }
+    if (pts > 0) {
+      const updatedUser = await User.findByIdAndUpdate(
+        booking.customer,
+        { $inc: { glowPoints: pts } },
+        { new: true }
+      ).select('glowPoints totalSpent');
+      await PointsLedger.create({
+        user: booking.customer, type: 'earned', points: pts,
+        reason: `Booking at ${booking.salon.name || 'salon'}`,
+        booking: booking._id, balanceAfter: updatedUser.glowPoints,
+      });
+    }
     notifyUser(booking.customer, {
       title: 'Hope you loved it! ✨',
       body: `Your booking ${booking.bookingCode} is complete. You earned ${pts} Glow Points.`,
@@ -394,16 +471,29 @@ exports.cancel = asyncHandler(async (req, res) => {
   // Customer < 1h before slot  -> no refund (token/amount forfeited)
   let refundAmount = 0;
   let goodwillPoints = 0;
-  if (booking.amountPaid > 0) {
-    if (!isCustomer) {
-      refundAmount = booking.amountPaid;
-      goodwillPoints = 50;
-    } else {
-      const slotDateTime = new Date(`${booking.date}T${booking.startTime}:00`);
-      const hoursLeft = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
+  // Late-cancellation penalty — separate from the refund tiers below. A
+  // customer cancelling very close to the slot (within lateCancelWindowHours,
+  // default 2h) is charged a small flat penalty ON TOP of whatever refund
+  // tier applies, same deterrent as the no-show penalty in updateStatus().
+  let penaltyAmount = 0;
+  if (isCustomer) {
+    const slotDateTime = new Date(`${booking.date}T${booking.startTime}:00`);
+    const hoursLeft = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
+    if (booking.amountPaid > 0) {
       if (hoursLeft >= 4) refundAmount = booking.amountPaid;
       else if (hoursLeft >= 1) refundAmount = Math.round(booking.amountPaid * 0.5);
       else refundAmount = 0;
+    }
+    if (hoursLeft < config.lateCancelWindowHours) {
+      try {
+        await debitWallet(booking.customer, config.noShowPenaltyAmount, 'penalty', `Late-cancellation penalty for booking ${booking.bookingCode}`, booking._id);
+        penaltyAmount = config.noShowPenaltyAmount;
+      } catch { /* insufficient balance — non-fatal, skip the penalty */ }
+    }
+  } else {
+    if (booking.amountPaid > 0) {
+      refundAmount = booking.amountPaid;
+      goodwillPoints = 50;
     }
   }
 
@@ -412,7 +502,16 @@ exports.cancel = asyncHandler(async (req, res) => {
     booking.paymentStatus = 'refunded';
   }
   if (goodwillPoints > 0) {
-    await User.findByIdAndUpdate(booking.customer, { $inc: { glowPoints: goodwillPoints } });
+    const updatedUser = await User.findByIdAndUpdate(
+      booking.customer,
+      { $inc: { glowPoints: goodwillPoints } },
+      { new: true }
+    ).select('glowPoints');
+    await PointsLedger.create({
+      user: booking.customer, type: 'earned', points: goodwillPoints,
+      reason: `Goodwill points for cancelled booking ${booking.bookingCode}`,
+      booking: booking._id, balanceAfter: updatedUser.glowPoints,
+    });
   }
   await booking.save();
 
@@ -430,7 +529,8 @@ exports.cancel = asyncHandler(async (req, res) => {
     title: 'Booking cancelled',
     body: `Booking ${booking.bookingCode} was cancelled.` +
       (refundAmount > 0 ? ` ₹${refundAmount} refunded to your wallet.` : '') +
-      (goodwillPoints > 0 ? ` ${goodwillPoints} Glow Points added for the inconvenience.` : ''),
+      (goodwillPoints > 0 ? ` ${goodwillPoints} Glow Points added for the inconvenience.` : '') +
+      (penaltyAmount > 0 ? ` ₹${penaltyAmount} late-cancellation penalty was deducted from your wallet.` : ''),
     type: 'booking', data: { bookingId: booking._id.toString() },
   });
   // notify salon owner (slot freed)
@@ -444,6 +544,41 @@ exports.cancel = asyncHandler(async (req, res) => {
   }
 
   sendResponse(res, 200, 'Booking cancelled', { booking, refundAmount });
+});
+
+// Statuses that count as "still in the queue" — not yet finished/cancelled.
+const ACTIVE_QUEUE_STATUSES = ['pending', 'confirmed', 'in_progress'];
+
+// Today's active bookings for a salon, ordered the same way the front-desk
+// would work through them: by scheduled time first, then by creation order
+// as a tiebreaker (two bookings at the same startTime — e.g. walk-ins logged
+// back-to-back — keep first-come-first-served order). Kept as a shared
+// helper so walkIn() and getQueue() agree on the same ordering/positions.
+async function loadTodayQueue(salonId) {
+  const date = localYmd();
+  return Booking.find({ salon: salonId, date, status: { $in: ACTIVE_QUEUE_STATUSES } })
+    .populate('customer', 'name')
+    .sort({ startTime: 1, createdAt: 1 });
+}
+
+// GET /bookings/salon/:salonId/queue   (owner/staff) — today's live queue board
+// Returns each active booking for today with its position number, for a
+// simple "who's next" display at the front desk.
+exports.getQueueForSalon = asyncHandler(async (req, res) => {
+  const salon = await Salon.findById(req.params.salonId);
+  if (!salon) throw ApiError.notFound('Salon not found');
+  const isOwner = salon.owner.toString() === req.user._id.toString();
+  const isAdmin = req.user.role === 'admin';
+  let isSalonStaff = false;
+  if (!isOwner && !isAdmin && req.user.role === 'staff') {
+    const staffDoc = await Staff.findOne({ salon: salon._id, user: req.user._id }).select('_id');
+    isSalonStaff = Boolean(staffDoc);
+  }
+  if (!isOwner && !isAdmin && !isSalonStaff) throw ApiError.forbidden('Not allowed');
+
+  const bookings = await loadTodayQueue(salon._id);
+  const queue = bookings.map((b, i) => ({ booking: b, position: i + 1 }));
+  sendResponse(res, 200, "Today's queue", { count: queue.length, queue });
 });
 
 // POST /bookings/walkin   { salon, staff, serviceIds, customerName?, startTime? }  (owner/staff)
@@ -469,9 +604,22 @@ exports.walkIn = asyncHandler(async (req, res) => {
   if (!services.length) throw ApiError.badRequest('No valid services');
 
   const subtotal = services.reduce((s, x) => s + (x.discountPrice || x.price), 0);
-  const commission = Math.round((subtotal * config.commissionPercent) / 100);
+  // Tier-aware rate (matches the manual booking flow) instead of a flat
+  // platform-wide rate — a walk-in is always settled at the salon.
+  const commissionPct = commissionPercentFor(salonDoc, 'at_salon', config);
+  const commission = Math.round((subtotal * commissionPct) / 100);
   const date = localYmd();
   const time = startTime || localTime();
+
+  // Queue position: this walk-in is being recorded as 'completed' immediately
+  // below (walk-ins are logged after the fact, not booked ahead), so its
+  // position is simply "how many are already active ahead of it right now" —
+  // i.e. the queue count BEFORE this one is added. This is a rough running
+  // count, not a precise scheduler — good enough for a front-desk display.
+  const queueCountBefore = await Booking.countDocuments({
+    salon, date, status: { $in: ACTIVE_QUEUE_STATUSES },
+  });
+  const queuePosition = queueCountBefore + 1;
 
   const booking = await Booking.create({
     customer: req.user._id, // recorded under the salon account for walk-ins
@@ -486,7 +634,7 @@ exports.walkIn = asyncHandler(async (req, res) => {
     isWalkIn: true, guestName: customerName || 'Walk-in',
   });
   await Salon.findByIdAndUpdate(salon, { $inc: { bookingCount: 1 } });
-  sendResponse(res, 201, 'Walk-in recorded', { booking });
+  sendResponse(res, 201, 'Walk-in recorded', { booking, queuePosition });
 });
 
 

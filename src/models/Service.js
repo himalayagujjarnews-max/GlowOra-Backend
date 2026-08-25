@@ -18,6 +18,11 @@ const serviceSchema = new mongoose.Schema(
     description: { type: String, maxlength: 500 },
     image: { type: String },
     homeServiceAvailable: { type: Boolean, default: false },
+    // Owner-flagged: treatments with an allergy/health risk (waxing, coloring,
+    // facials, etc.) can require the customer to submit a digital consent/
+    // health form before booking. Defaults to false so existing services are
+    // unaffected until an owner opts in — see consentForm.controller.js.
+    requiresConsent: { type: Boolean, default: false },
     active: { type: Boolean, default: true },
   },
   { timestamps: true }

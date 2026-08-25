@@ -9,6 +9,7 @@ const mongoose = require('mongoose');
 const Payout = require('../models/Payout');
 const Booking = require('../models/Booking');
 const Salon = require('../models/Salon');
+const Staff = require('../models/Staff');
 
 // GET /payouts/pending   (admin — aggregate unpaid completed bookings per salon)
 exports.pending = asyncHandler(async (req, res) => {
@@ -29,16 +30,32 @@ exports.pending = asyncHandler(async (req, res) => {
   sendResponse(res, 200, 'Pending payouts', { payouts: result });
 });
 
-// POST /payouts   { salon, amount, bookingsCount, periodFrom, periodTo, method, reference }  (admin)
+// POST /payouts   { salon, amount, ... } OR { staff, amount, ... }  (admin)
+// Manual, offline payout record — admin has already transferred the money
+// themselves and is just logging it. This is now the FALLBACK path; the
+// normal path is the automated T+1 wallet settlement job (see
+// scheduler.service.js `runWalletSettlement`), which creates its own Payout
+// docs with source: 'wallet_settlement'.
 exports.create = asyncHandler(async (req, res) => {
-  const { salon, amount } = req.body;
-  if (!salon || amount == null) throw ApiError.badRequest('salon and amount are required');
+  const { salon, staff, amount } = req.body;
+  if (amount == null) throw ApiError.badRequest('amount is required');
+  if (!salon && !staff) throw ApiError.badRequest('salon or staff is required');
+  const recipientType = staff ? 'staff' : 'salon';
   const payout = await Payout.create({
     ...req.body,
+    recipientType,
     status: 'paid',
+    source: 'manual',
     processedAt: new Date(),
     processedBy: req.user._id,
   });
+
+  // Staff payouts are a straightforward manual record — no linked bookings
+  // to reconcile against (that reconciliation only applies to salon payouts,
+  // handled below).
+  if (recipientType === 'staff') {
+    return sendResponse(res, 201, 'Payout recorded', { payout });
+  }
 
   // Only mark outstanding bookings as paid out up to the amount actually paid.
   // Oldest-first, all-or-nothing per booking — never partially mark a booking.
@@ -63,17 +80,43 @@ exports.create = asyncHandler(async (req, res) => {
   sendResponse(res, 201, 'Payout recorded', { payout });
 });
 
-// GET /payouts/mine   (owner)
+// GET /payouts/mine   (owner or staff — resolves whichever wallet they own)
 exports.mine = asyncHandler(async (req, res) => {
+  if (req.user.role === 'staff') {
+    const staffDocs = await Staff.find({ user: req.user._id }).select('_id');
+    const payouts = await Payout.find({ recipientType: 'staff', staff: { $in: staffDocs.map((s) => s._id) } }).sort({ createdAt: -1 });
+    return sendResponse(res, 200, 'Payouts', { payouts });
+  }
   const salons = await Salon.find({ owner: req.user._id }).select('_id');
-  const payouts = await Payout.find({ salon: { $in: salons.map((s) => s._id) } }).populate('salon', 'name').sort({ createdAt: -1 });
+  const payouts = await Payout.find({ recipientType: 'salon', salon: { $in: salons.map((s) => s._id) } }).populate('salon', 'name').sort({ createdAt: -1 });
   sendResponse(res, 200, 'Payouts', { payouts });
+});
+
+// PATCH /payouts/:id  { status, reference? }  (admin)
+// Admin confirms a 'processing' automated settlement actually landed in the
+// recipient's bank account (or mark it 'failed' if the transfer bounced —
+// e.g. bad IFSC — so the money can be manually reconciled/re-credited).
+exports.updateStatus = asyncHandler(async (req, res) => {
+  const { status, reference } = req.body;
+  if (!['paid', 'failed'].includes(status)) throw ApiError.badRequest('status must be paid or failed');
+  const payout = await Payout.findById(req.params.id);
+  if (!payout) throw ApiError.notFound('Payout not found');
+  payout.status = status;
+  if (reference) payout.reference = reference;
+  payout.processedAt = new Date();
+  payout.processedBy = req.user._id;
+  await payout.save();
+  sendResponse(res, 200, `Payout marked ${status}`, { payout });
 });
 
 // GET /payouts   (admin — all)
 exports.adminList = asyncHandler(async (req, res) => {
   const filter = {};
   if (req.query.status) filter.status = req.query.status;
-  const payouts = await Payout.find(filter).populate('salon', 'name address.city').sort({ createdAt: -1 });
+  if (req.query.recipientType) filter.recipientType = req.query.recipientType;
+  const payouts = await Payout.find(filter)
+    .populate('salon', 'name address.city')
+    .populate('staff', 'name')
+    .sort({ createdAt: -1 });
   sendResponse(res, 200, 'Payouts', { payouts });
 });

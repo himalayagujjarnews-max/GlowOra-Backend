@@ -28,6 +28,19 @@ function errorHandler(err, req, res, next) {
     const details = Object.values(err.errors).map((e) => e.message);
     error = ApiError.badRequest('Validation failed', details);
   }
+  // Multer upload errors (oversized file, wrong field name, too many files) —
+  // several upload endpoints were added this session (staff portfolio,
+  // review photos, etc.) with no dedicated handling, so these were falling
+  // through to a raw 500 "Something went wrong" for what's really a client
+  // mistake (e.g. a photo over the 5MB limit).
+  if (err.name === 'MulterError') {
+    const messages = {
+      LIMIT_FILE_SIZE: 'File is too large (max 5MB).',
+      LIMIT_UNEXPECTED_FILE: 'Unexpected file field.',
+      LIMIT_FILE_COUNT: 'Too many files.',
+    };
+    error = ApiError.badRequest(messages[err.code] || 'Upload failed.');
+  }
 
   const statusCode = error.statusCode || 500;
   const message = error.isOperational ? error.message : 'Something went wrong';

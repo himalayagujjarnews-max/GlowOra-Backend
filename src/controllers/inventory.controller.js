@@ -6,6 +6,7 @@ const ApiError = require('../utils/ApiError');
 const sendResponse = require('../utils/ApiResponse');
 const InventoryItem = require('../models/InventoryItem');
 const Salon = require('../models/Salon');
+const { notifyUser } = require('../services/notification.service');
 
 async function assertOwns(user, salonId) {
   const salon = await Salon.findById(salonId);
@@ -13,6 +14,7 @@ async function assertOwns(user, salonId) {
   if (salon.owner.toString() !== user._id.toString() && user.role !== 'admin') {
     throw ApiError.forbidden('Not your salon');
   }
+  return salon;
 }
 
 // GET /inventory?salon=&lowStock=
@@ -51,9 +53,24 @@ exports.adjust = asyncHandler(async (req, res) => {
   if (!delta) throw ApiError.badRequest('delta required (e.g. -1 or +10)');
   const item = await InventoryItem.findById(req.params.id);
   if (!item) throw ApiError.notFound('Item not found');
-  await assertOwns(req.user, item.salon);
+  const salon = await assertOwns(req.user, item.salon);
+
+  const wasLowStock = item.quantity <= item.lowStockThreshold;
   item.quantity = Math.max(0, item.quantity + delta);
   await item.save();
+
+  // Only fire when the item just CROSSED into low-stock (not already low) —
+  // avoids re-notifying the owner on every subsequent adjustment while stock
+  // stays low.
+  const isLowStock = item.quantity <= item.lowStockThreshold;
+  if (isLowStock && !wasLowStock) {
+    notifyUser(salon.owner, {
+      title: 'Low stock alert',
+      body: `${item.name} is running low (${item.quantity} ${item.unit || 'left'})`,
+      type: 'system',
+    });
+  }
+
   sendResponse(res, 200, 'Stock adjusted', { item });
 });
 

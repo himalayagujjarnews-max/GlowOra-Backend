@@ -7,6 +7,7 @@ const Booking = require('../models/Booking');
 const Service = require('../models/Service');
 const Salon = require('../models/Salon');
 const Product = require('../models/Product');
+const { escapeRegex } = require('../utils/helpers');
 
 /** Services a customer books most, to prefill "book again". */
 async function frequentServices(userId, limit = 5) {
@@ -57,7 +58,7 @@ async function recommendedProducts(userId, limit = 6) {
 async function discoverSalons(userId, city, limit = 6) {
   const visited = await Booking.distinct('salon', { customer: toId(userId) });
   const filter = { status: 'active', _id: { $nin: visited } };
-  if (city) filter['address.city'] = new RegExp(`^${city}$`, 'i');
+  if (city) filter['address.city'] = new RegExp(`^${escapeRegex(city)}$`, 'i');
   return Salon.find(filter).sort({ isFeatured: -1, rating: -1 }).limit(limit)
     .select('name coverImage address rating reviewCount type');
 }

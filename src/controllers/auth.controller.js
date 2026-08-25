@@ -18,6 +18,7 @@ const config = require('../config/env');
 const { notifyUser } = require('../services/notification.service');
 const { admin: firebaseAdmin, enabled: firebaseEnabled } = require('../config/firebase');
 const { OAuth2Client } = require('google-auth-library');
+const appleSignin = require('apple-signin-auth');
 
 const googleClient = config.googleClientIds.length ? new OAuth2Client() : null;
 
@@ -29,6 +30,13 @@ function publicUser(u) {
     gender: u.gender, dob: u.dob, emailVerified: u.emailVerified,
     hasPassword: Boolean(u.password),
     twoFactorEnabled: u.twoFactorEnabled,
+    notificationsEnabled: u.notificationsEnabled,
+    notificationPrefs: u.notificationPrefs,
+    // Loyalty tier — computed from lifetime spend, never stored directly, so
+    // the frontend always gets an up-to-date tier without a separate call.
+    totalSpent: u.totalSpent || 0,
+    loyaltyTier: User.getTier(u.totalSpent || 0),
+    identityVerification: u.identityVerification,
   };
 }
 
@@ -318,6 +326,74 @@ exports.googleLogin = asyncHandler(async (req, res) => {
   });
 });
 
+// POST /auth/apple-login  { identityToken, fullName?, role? }
+// Sign in with Apple — client gets an identityToken from
+// expo-apple-authentication's native prompt; we verify it against Apple's
+// public keys (audience = our app bundle IDs) and issue our own GlowOra
+// session. Mirrors googleLogin above almost exactly.
+//
+// Two Apple quirks googleLogin doesn't have to deal with:
+//  1. Apple only sends the user's name ONCE, in the native response itself
+//     (never in the identityToken, and never again on subsequent logins) —
+//     so the client must pass it the first time as `fullName`, and we save
+//     it then-and-only-then.
+//  2. `email` may be a private relay address ("Hide My Email") — that's
+//     still a usable, unique email for our purposes, just not their real one.
+exports.appleLogin = asyncHandler(async (req, res) => {
+  const { identityToken, fullName, role } = req.body;
+  if (!identityToken) throw ApiError.badRequest('identityToken is required');
+  if (!config.appleClientIds.length) throw ApiError.internal('Apple sign-in is not configured on the server');
+
+  let payload;
+  try {
+    payload = await appleSignin.verifyIdToken(identityToken, {
+      audience: config.appleClientIds,
+      ignoreExpiration: false,
+    });
+  } catch (err) {
+    throw ApiError.unauthorized('Invalid or expired Apple sign-in token');
+  }
+
+  const email = String(payload.email || '').trim().toLowerCase();
+  if (!email) throw ApiError.badRequest('No email on this Apple account');
+
+  let user = await User.findOne({ email }).select('+twoFactorSecret +twoFactorBackupCodes');
+  let isNew = false;
+  if (!user) {
+    user = await User.create({
+      email,
+      name: fullName || undefined,
+      role: role && ['customer', 'owner'].includes(role) ? role : 'customer',
+      emailVerified: true,
+      lastLoginAt: new Date(),
+    });
+    isNew = true;
+    sendWelcomeNotification(user);
+  } else {
+    user.emailVerified = true;
+    user.lastLoginAt = new Date();
+    if (fullName && !user.name) user.name = fullName;
+    resolveLoginRole(user, role);
+    await user.save();
+  }
+
+  if (user.twoFactorEnabled) {
+    if (!req.body.twoFactorCode) {
+      return sendResponse(res, 200, 'Two-factor code required', { twoFactorRequired: true, email });
+    }
+    if (!(await verifyTwoFactor(user, req.body.twoFactorCode))) {
+      await logLogin(user, '2fa', false, req, 'invalid_2fa');
+      throw ApiError.unauthorized('Invalid two-factor code');
+    }
+  }
+
+  const tokens = await sessionService.createSession(user, reqCtx(req));
+  await logLogin(user, 'apple', true, req);
+  sendResponse(res, isNew ? 201 : 200, isNew ? 'Account created' : 'Logged in successfully', {
+    isNewUser: isNew, user: publicUser(user), ...tokens,
+  });
+});
+
 // POST /auth/login  { phone|email, password }  — login by phone OR email
 exports.login = asyncHandler(async (req, res) => {
   const { phone, email, password } = req.body;
@@ -440,6 +516,18 @@ exports.registerFcm = asyncHandler(async (req, res) => {
 // GET /auth/me  (protected)
 exports.getMe = asyncHandler(async (req, res) => {
   sendResponse(res, 200, 'Current user', { user: publicUser(req.user) });
+});
+
+// PATCH /auth/notification-prefs  (protected)  { bookings?, offers?, chat?, system? }
+// Per-category toggle — matches the keys notification.service.js checks
+// before sending a push (TYPE_TO_PREF maps Notification `type` → these keys).
+exports.updateNotificationPrefs = asyncHandler(async (req, res) => {
+  const allowed = ['bookings', 'offers', 'chat', 'system'];
+  const user = await User.findById(req.user._id);
+  if (!user.notificationPrefs) user.notificationPrefs = {};
+  allowed.forEach((k) => { if (typeof req.body[k] === 'boolean') user.notificationPrefs[k] = req.body[k]; });
+  await user.save();
+  sendResponse(res, 200, 'Notification preferences updated', { user: publicUser(user) });
 });
 
 const EMAIL_RE = /^\S+@\S+\.\S+$/;

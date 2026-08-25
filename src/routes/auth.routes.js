@@ -15,6 +15,8 @@ router.post('/verify-otp', authLimiter, [phoneRule, body('otp').isLength({ min: 
 router.post('/firebase-login', authLimiter, [body('idToken').notEmpty()], validate, ctrl.firebaseLogin);
 // Google Sign-In — client verifies via Google's own SDK, sends us the ID token
 router.post('/google-login', authLimiter, [body('idToken').notEmpty()], validate, ctrl.googleLogin);
+// Sign in with Apple — client verifies via Apple's native prompt, sends us the identityToken
+router.post('/apple-login', authLimiter, [body('identityToken').notEmpty()], validate, ctrl.appleLogin);
 // login accepts phone OR email + password (validation done in controller)
 router.post('/login', authLimiter, [body('password').notEmpty()], validate, ctrl.login);
 router.post('/forgot-password', authLimiter, [phoneRule], validate, ctrl.forgotPassword);
@@ -29,5 +31,6 @@ router.post('/set-password', protect, ctrl.setPassword);
 router.post('/logout', protect, ctrl.logout);
 router.post('/fcm-token', protect, ctrl.registerFcm);
 router.get('/me', protect, ctrl.getMe);
+router.patch('/notification-prefs', protect, ctrl.updateNotificationPrefs);
 
 module.exports = router;

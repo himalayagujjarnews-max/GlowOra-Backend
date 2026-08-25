@@ -8,6 +8,7 @@ const Staff = require('../models/Staff');
 const Salon = require('../models/Salon');
 const User = require('../models/User');
 const { notifyUser } = require('../services/notification.service');
+const { uploadImage } = require('../config/cloudinary');
 
 async function assertOwnsSalon(user, salonId) {
   const salon = await Salon.findById(salonId);
@@ -17,6 +18,30 @@ async function assertOwnsSalon(user, salonId) {
   }
   return salon;
 }
+
+// Portfolio access: the salon owner (or admin), OR the staff member managing
+// their OWN Staff doc (same self-access pattern as shift.controller.js's
+// assertAllowed / booking.controller.js's isAssignedStaff — resolved via the
+// linked `user` field rather than role alone, since 'staff' role alone
+// doesn't prove it's THIS staff doc).
+async function assertCanManagePortfolio(user, staff) {
+  const salon = await Salon.findById(staff.salon);
+  if (!salon) throw ApiError.notFound('Salon not found');
+  const isOwner = salon.owner.toString() === user._id.toString();
+  const isAdmin = user.role === 'admin';
+  const isSelf = user.role === 'staff' && staff.user && staff.user.toString() === user._id.toString();
+  if (!isOwner && !isAdmin && !isSelf) {
+    throw ApiError.forbidden('You can only manage your own portfolio');
+  }
+}
+
+// GET /api/v1/staff/mine  (staff — resolves the logged-in staff's own Staff
+// record(s) + salon, so the partner app doesn't need a separate lookup to
+// know "which salon/staff am I" before fetching e.g. their own roster).
+exports.mine = asyncHandler(async (req, res) => {
+  const staff = await Staff.find({ user: req.user._id }).populate('salon', 'name');
+  sendResponse(res, 200, 'Your staff record', { count: staff.length, staff });
+});
 
 // GET /api/v1/staff?salon=
 exports.list = asyncHandler(async (req, res) => {
@@ -70,7 +95,7 @@ exports.update = asyncHandler(async (req, res) => {
   const staff = await Staff.findById(req.params.id);
   if (!staff) throw ApiError.notFound('Staff not found');
   await assertOwnsSalon(req.user, staff.salon);
-  const allowed = ['name', 'phone', 'avatar', 'specialities', 'status', 'active'];
+  const allowed = ['name', 'phone', 'avatar', 'specialities', 'status', 'active', 'commissionPercent'];
   allowed.forEach((k) => { if (req.body[k] !== undefined) staff[k] = req.body[k]; });
   await staff.save();
   sendResponse(res, 200, 'Staff updated', { staff });
@@ -84,4 +109,108 @@ exports.remove = asyncHandler(async (req, res) => {
   staff.active = false;
   await staff.save();
   sendResponse(res, 200, 'Staff removed');
+});
+
+// POST /api/v1/staff/:id/portfolio  (owner or the staff member themselves)
+// Multipart: two named fields `before` and `after` (one file each — see
+// upload.fields() in staff.routes.js) plus a text field `caption`. Mirrors
+// salon.controller.js's uploadImages (same multer memoryStorage + uploadImage
+// cloudinary helper), just two named fields instead of one array field since
+// before/after are semantically distinct, not an interchangeable gallery.
+exports.addPortfolio = asyncHandler(async (req, res) => {
+  const staff = await Staff.findById(req.params.id);
+  if (!staff) throw ApiError.notFound('Staff not found');
+  await assertCanManagePortfolio(req.user, staff);
+
+  const beforeFile = req.files?.before?.[0];
+  const afterFile = req.files?.after?.[0];
+  if (!beforeFile || !afterFile) throw ApiError.badRequest('Both before and after images are required');
+
+  const [beforeUpload, afterUpload] = await Promise.all([
+    uploadImage(beforeFile.buffer, 'glowora/portfolio'),
+    uploadImage(afterFile.buffer, 'glowora/portfolio'),
+  ]);
+
+  staff.portfolio.push({
+    before: beforeUpload.url,
+    after: afterUpload.url,
+    caption: req.body.caption,
+  });
+  await staff.save();
+  sendResponse(res, 201, 'Portfolio entry added', { staff });
+});
+
+// Bank details access: owner/admin, OR the staff member managing their OWN
+// record — same self-access pattern as assertCanManagePortfolio above.
+async function assertCanManageBank(user, staff) {
+  const salon = await Salon.findById(staff.salon);
+  if (!salon) throw ApiError.notFound('Salon not found');
+  const isOwner = salon.owner.toString() === user._id.toString();
+  const isAdmin = user.role === 'admin';
+  const isSelf = user.role === 'staff' && staff.user && staff.user.toString() === user._id.toString();
+  if (!isOwner && !isAdmin && !isSelf) {
+    throw ApiError.forbidden('You can only manage your own bank details');
+  }
+}
+
+// GET /api/v1/staff/:id/bank  (owner/admin or the staff member themselves)
+exports.getBank = asyncHandler(async (req, res) => {
+  const staff = await Staff.findById(req.params.id).select('+bankDetails salon user name walletBalance bankVerified');
+  if (!staff) throw ApiError.notFound('Staff not found');
+  await assertCanManageBank(req.user, staff);
+  sendResponse(res, 200, 'Bank details', { staff });
+});
+
+// PATCH /api/v1/staff/:id/bank  (owner/admin or the staff member themselves)
+// Changing bank details resets bankVerified — a changed account number must
+// be re-checked by admin before it's eligible for auto-settlement again
+// (mirrors the intent, if not yet the mechanism, of a real bank-verification flow).
+exports.updateBank = asyncHandler(async (req, res) => {
+  const staff = await Staff.findById(req.params.id).select('+bankDetails salon user bankVerified');
+  if (!staff) throw ApiError.notFound('Staff not found');
+  await assertCanManageBank(req.user, staff);
+  const { accountName, accountNumber, ifsc, upiId } = req.body;
+  staff.bankDetails = { accountName, accountNumber, ifsc, upiId };
+  staff.bankVerified = false;
+  await staff.save();
+  sendResponse(res, 200, 'Bank details updated — pending verification', { staff });
+});
+
+// GET /api/v1/staff/admin/pending-bank  (admin) — staff who've submitted bank
+// details but aren't verified yet, for the admin bank-verification queue.
+exports.pendingBankVerification = asyncHandler(async (req, res) => {
+  const staff = await Staff.find({
+    'bankDetails.accountNumber': { $exists: true, $ne: null, $nin: ['', null] },
+    bankVerified: false,
+  })
+    .select('+bankDetails name salon user bankVerified')
+    .populate('salon', 'name')
+    .sort({ updatedAt: -1 });
+  sendResponse(res, 200, 'Staff pending bank verification', { staff });
+});
+
+// PATCH /api/v1/staff/:id/verify-bank  { verified: true|false }  (admin)
+// Mirrors salon.controller.js's verifyBank — no real bank-API verification,
+// admin manually reviews the (decrypted) account details and flips this flag.
+exports.verifyBank = asyncHandler(async (req, res) => {
+  const staff = await Staff.findByIdAndUpdate(
+    req.params.id,
+    { bankVerified: req.body.verified !== false },
+    { new: true }
+  ).select('+bankDetails name bankVerified');
+  if (!staff) throw ApiError.notFound('Staff not found');
+  sendResponse(res, 200, `Bank account ${staff.bankVerified ? 'verified' : 'unverified'}`, { staff });
+});
+
+// DELETE /api/v1/staff/:id/portfolio/:entryId  (owner or the staff member themselves)
+exports.removePortfolio = asyncHandler(async (req, res) => {
+  const staff = await Staff.findById(req.params.id);
+  if (!staff) throw ApiError.notFound('Staff not found');
+  await assertCanManagePortfolio(req.user, staff);
+
+  const entry = staff.portfolio.id(req.params.entryId);
+  if (!entry) throw ApiError.notFound('Portfolio entry not found');
+  entry.deleteOne(); // Mongoose subdocument removal
+  await staff.save();
+  sendResponse(res, 200, 'Portfolio entry removed', { staff });
 });

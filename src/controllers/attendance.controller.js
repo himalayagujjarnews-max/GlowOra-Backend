@@ -20,11 +20,28 @@ async function assertOwns(user, salonId) {
 }
 
 // POST /attendance   { staff, salon, date?, status, checkIn?, checkOut? }
+// Owners can mark attendance for anyone on their salon's team. Staff can only
+// mark their OWN attendance — the staff/salon ids they send are ignored in
+// that case and resolved server-side from their linked Staff doc, so the
+// self-check-in button in the app doesn't need to know its own Staff._id.
 exports.mark = asyncHandler(async (req, res) => {
-  const { staff, salon, status } = req.body;
-  if (!staff || !salon || !status) throw ApiError.badRequest('staff, salon and status are required');
-  await assertOwns(req.user, salon);
+  let { staff, salon, status } = req.body;
+  if (!status) throw ApiError.badRequest('status is required');
+
+  if (req.user.role === 'staff') {
+    const staffDoc = await Staff.findOne({ user: req.user._id });
+    if (!staffDoc) throw ApiError.notFound('No staff profile linked to your account');
+    staff = staffDoc._id;
+    salon = staffDoc.salon;
+  } else {
+    if (!staff || !salon) throw ApiError.badRequest('staff, salon and status are required');
+    await assertOwns(req.user, salon);
+  }
+
   const date = req.body.date || ymd();
+  // NOTE: this replaces checkIn/checkOut wholesale on every call — callers
+  // marking a checkout must resend the original checkIn value (the partner
+  // app's check-in button keeps it in local state) or it will be cleared.
   const record = await StaffAttendance.findOneAndUpdate(
     { staff, date },
     { staff, salon, date, status, checkIn: req.body.checkIn, checkOut: req.body.checkOut, note: req.body.note },
