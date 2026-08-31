@@ -138,6 +138,16 @@ exports.webhook = asyncHandler(async (req, res) => {
 
 // GET /payments/mine
 exports.myPayments = asyncHandler(async (req, res) => {
-  const payments = await Payment.find({ customer: req.user._id }).populate('booking', 'bookingCode date').sort({ createdAt: -1 });
-  sendResponse(res, 200, 'Payments', { payments });
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+  const filter = { customer: req.user._id };
+  const [payments, total] = await Promise.all([
+    Payment.find(filter)
+      .populate('booking', 'bookingCode date')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit),
+    Payment.countDocuments(filter),
+  ]);
+  sendResponse(res, 200, 'Payments', { payments, page, limit, total, hasMore: page * limit < total });
 });

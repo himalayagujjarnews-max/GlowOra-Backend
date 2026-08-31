@@ -51,13 +51,22 @@ exports.update = asyncHandler(async (req, res) => {
 exports.adjust = asyncHandler(async (req, res) => {
   const delta = parseInt(req.body.delta, 10);
   if (!delta) throw ApiError.badRequest('delta required (e.g. -1 or +10)');
-  const item = await InventoryItem.findById(req.params.id);
-  if (!item) throw ApiError.notFound('Item not found');
-  const salon = await assertOwns(req.user, item.salon);
+  const existing = await InventoryItem.findById(req.params.id);
+  if (!existing) throw ApiError.notFound('Item not found');
+  const salon = await assertOwns(req.user, existing.salon);
 
-  const wasLowStock = item.quantity <= item.lowStockThreshold;
-  item.quantity = Math.max(0, item.quantity + delta);
-  await item.save();
+  const wasLowStock = existing.quantity <= existing.lowStockThreshold;
+
+  // Atomic update: only applies the $inc if it won't push quantity below 0.
+  // This guards against the race where two concurrent adjust requests (e.g.
+  // from two devices) both read the same stale quantity — the $gte filter
+  // is evaluated by MongoDB against the current document, not our stale copy.
+  const item = await InventoryItem.findOneAndUpdate(
+    { _id: req.params.id, quantity: { $gte: -delta } },
+    { $inc: { quantity: delta } },
+    { new: true }
+  );
+  if (!item) throw ApiError.badRequest('Not enough stock');
 
   // Only fire when the item just CROSSED into low-stock (not already low) —
   // avoids re-notifying the owner on every subsequent adjustment while stock

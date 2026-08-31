@@ -102,6 +102,16 @@ const config = {
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
   },
 
+  // WhatsApp Cloud API (Meta) — used for booking reminders alongside push
+  // notifications. Optional: if unset, whatsapp.service.js silently no-ops
+  // (same "dev fallback" convention as twilio/otp.js). Get these from
+  // Meta for Developers > WhatsApp > API Setup once the app is set up.
+  whatsapp: {
+    apiToken: process.env.WHATSAPP_API_TOKEN,
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+    apiVersion: process.env.WHATSAPP_API_VERSION || 'v20.0',
+  },
+
   googleMapsKey: process.env.GOOGLE_MAPS_API_KEY,
 
   // Google Sign-In — accepted OAuth client IDs (Android + Web), comma-separated

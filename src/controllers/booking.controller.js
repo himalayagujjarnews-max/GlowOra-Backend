@@ -15,6 +15,10 @@ const User = require('../models/User');
 const FamilyMember = require('../models/FamilyMember');
 const PointsLedger = require('../models/PointsLedger'); // Glow Points earn/redeem history
 const AbandonedCart = require('../models/AbandonedCart'); // cleared once a booking actually completes
+const StaffBlockout = require('../models/StaffBlockout');  // specific date/time blocks (lunch, personal, etc.)
+const Payment = require('../models/Payment');
+const rp = require('../config/razorpay');
+const logger = require('../utils/logger');
 const { notifyUser } = require('../services/notification.service');
 const { evaluate: evaluateCoupon } = require('./coupon.controller');
 const { debitWallet, creditWallet } = require('./wallet.controller');
@@ -49,7 +53,22 @@ exports.getAvailability = asyncHandler(async (req, res) => {
   const taken = await Slot.find({ staff, date, status: { $in: ['booked', 'held'] } }).select('startTime');
   const takenSet = new Set(taken.map((s) => s.startTime));
 
-  const slots = all.map((t) => ({ time: t, available: !takenSet.has(t) }));
+  // Also block slots that fall within any active staff blockout for this date.
+  // An all-day blockout (startTime=null) marks every slot unavailable.
+  const blockouts = staff
+    ? await StaffBlockout.find({ staff, date }).select('startTime endTime')
+    : [];
+
+  function isBlockedOut(slotTime) {
+    if (!blockouts.length) return false;
+    for (const b of blockouts) {
+      if (!b.startTime) return true; // all-day blockout
+      if (slotTime >= b.startTime && slotTime < b.endTime) return true;
+    }
+    return false;
+  }
+
+  const slots = all.map((t) => ({ time: t, available: !takenSet.has(t) && !isBlockedOut(t) }));
   sendResponse(res, 200, 'Availability', { date, slots });
 });
 
@@ -144,13 +163,28 @@ exports.create = asyncHandler(async (req, res) => {
   });
   if (clash) throw ApiError.conflict('This stylist is already booked during that time. Please pick another slot.');
 
-  // reserve slot (unique index guards against exact-time races)
+  // reserve slot (unique index only guards exact-startTime races)
   let slot;
   try {
     slot = await Slot.create({ salon, staff, date, startTime, endTime, status: 'booked' });
   } catch (err) {
     if (err.code === 11000) throw ApiError.conflict('That time slot was just taken. Please pick another.');
     throw err;
+  }
+  // Post-insert re-check: the overlap query above (line ~158) is check-then-act,
+  // so two concurrent requests for the SAME staff but DIFFERENT start times that
+  // overlap (e.g. 10:00-11:00 and 10:30-11:30) could both pass it before either
+  // slot exists. The unique index on {staff,date,startTime} doesn't catch this
+  // since the start times differ. Re-verify right after our own insert commits —
+  // if another overlapping slot now exists, we lost the race; release ours.
+  const others = await Slot.find({ staff, date, status: { $in: ['booked', 'held'] }, _id: { $ne: slot._id } }).select('startTime endTime');
+  const stillClashes = others.some((s) => {
+    const sS = toMin(s.startTime); const sE = toMin(s.endTime || s.startTime);
+    return startMin < sE && endMin > sS;
+  });
+  if (stillClashes) {
+    await Slot.findByIdAndDelete(slot._id);
+    throw ApiError.conflict('This stylist is already booked during that time. Please pick another slot.');
   }
 
   // payment state — only wallet is charged now; token/full_online happen at /payments/verify
@@ -250,6 +284,27 @@ exports.getMine = asyncHandler(async (req, res) => {
     .populate('staff', 'name avatar')
     .sort({ createdAt: -1 });
   sendResponse(res, 200, 'Your bookings', { count: bookings.length, bookings });
+});
+
+// GET /api/v1/bookings/:id  — single booking, for the customer's Confirm/
+// success screen to verify a booking (and its payment) actually went through
+// before showing a "you're all set" state, and for booking-detail views.
+exports.getOne = asyncHandler(async (req, res) => {
+  const booking = await Booking.findById(req.params.id)
+    .populate('salon', 'name coverImage address owner')
+    .populate('staff', 'name avatar');
+  if (!booking) throw ApiError.notFound('Booking not found');
+  const uid = req.user._id.toString();
+  const isCustomer = booking.customer.toString() === uid;
+  const isOwner = booking.salon?.owner && booking.salon.owner.toString() === uid;
+  const isAdmin = req.user.role === 'admin';
+  let isAssignedStaff = false;
+  if (!isCustomer && !isOwner && !isAdmin && req.user.role === 'staff') {
+    const staffDoc = await Staff.findOne({ _id: booking.staff, user: req.user._id }).select('_id');
+    isAssignedStaff = Boolean(staffDoc);
+  }
+  if (!isCustomer && !isOwner && !isAdmin && !isAssignedStaff) throw ApiError.forbidden('Not allowed');
+  sendResponse(res, 200, 'Booking', { booking });
 });
 
 // GET /api/v1/bookings/salon/:salonId?status=  (owner/staff)
@@ -358,7 +413,7 @@ exports.updateStatus = asyncHandler(async (req, res) => {
     // award loyalty points — tier multiplier is based on the customer's
     // lifetime spend BEFORE this booking (their current tier), so crossing
     // a threshold only boosts points starting next booking, not retroactively.
-    const customerBefore = await User.findById(booking.customer).select('totalSpent');
+    const customerBefore = await User.findById(booking.customer).select('totalSpent referredBy referralRewarded');
     const tierBefore = User.getTier(customerBefore?.totalSpent || 0);
     const tierMultiplier = User.TIER_POINTS_MULTIPLIER[tierBefore] || 1;
     const pts = Math.round(booking.total * config.loyaltyPointsPerRupee * tierMultiplier);
@@ -384,6 +439,25 @@ exports.updateStatus = asyncHandler(async (req, res) => {
       type: 'booking',
       data: { bookingId: booking._id.toString() },
     });
+
+    // Referral reward — pays the referrer only once, when the REFERRED
+    // customer completes their first booking (not at signup). This closes
+    // the old loophole where a fake signup with no real booking could still
+    // farm the referral bonus.
+    if (customerBefore?.referredBy && !customerBefore.referralRewarded) {
+      const priorCompleted = await Booking.countDocuments({
+        customer: booking.customer, status: 'completed', _id: { $ne: booking._id },
+      });
+      if (priorCompleted === 0) {
+        await User.findByIdAndUpdate(booking.customer, { referralRewarded: true });
+        await User.findByIdAndUpdate(customerBefore.referredBy, { $inc: { walletBalance: config.referralBonus } });
+        notifyUser(customerBefore.referredBy, {
+          title: 'Referral bonus! 🎉',
+          body: `You earned ₹${config.referralBonus} — your friend just completed their first booking on GlowOra.`,
+          type: 'promo',
+        });
+      }
+    }
 
     // smart product recommendation — nudge to buy what was used on them
     if (booking.productsUsed?.length) {
@@ -425,13 +499,26 @@ exports.reschedule = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('Only upcoming bookings can be rescheduled');
   }
 
-  // free old slot
-  await Slot.findByIdAndUpdate(booking.slot, { status: 'available', booking: null });
-
   const totalDuration = booking.services.reduce((s, x) => s + (x.durationMinutes || 0), 0);
   const [h, m] = startTime.split(':').map(Number);
-  const endMin = h * 60 + m + totalDuration;
+  const startMin = h * 60 + m;
+  const endMin = startMin + totalDuration;
   const endTime = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
+  const toMin = (t) => { const [hh, mm] = t.split(':').map(Number); return hh * 60 + mm; };
+
+  // Unlike create(), this endpoint previously had NO overlap check at all —
+  // it relied solely on the exact-startTime unique index, so a customer could
+  // reschedule straight into a window that overlaps another confirmed booking
+  // for the same staff (different start time = index doesn't catch it).
+  const sameDay = await Slot.find({ staff: booking.staff, date, status: { $in: ['booked', 'held'] }, _id: { $ne: booking.slot } }).select('startTime endTime');
+  const clash = sameDay.some((s) => {
+    const sS = toMin(s.startTime); const sE = toMin(s.endTime || s.startTime);
+    return startMin < sE && endMin > sS;
+  });
+  if (clash) throw ApiError.conflict('This stylist is already booked during that time. Please pick another slot.');
+
+  // free old slot only after the new-slot overlap check passes above
+  await Slot.findByIdAndUpdate(booking.slot, { status: 'available', booking: null });
 
   let slot;
   try {
@@ -439,6 +526,18 @@ exports.reschedule = asyncHandler(async (req, res) => {
   } catch (err) {
     if (err.code === 11000) throw ApiError.conflict('That time slot is taken. Please pick another.');
     throw err;
+  }
+  // Post-insert re-check (same race-closing pattern as create()) — a
+  // different-start-time overlap could have been inserted by another
+  // concurrent request between our check above and this insert.
+  const othersAfter = await Slot.find({ staff: booking.staff, date, status: { $in: ['booked', 'held'] }, _id: { $ne: slot._id } }).select('startTime endTime');
+  const stillClashes = othersAfter.some((s) => {
+    const sS = toMin(s.startTime); const sE = toMin(s.endTime || s.startTime);
+    return startMin < sE && endMin > sS;
+  });
+  if (stillClashes) {
+    await Slot.findByIdAndDelete(slot._id);
+    throw ApiError.conflict('This stylist is already booked during that time. Please pick another slot.');
   }
   booking.slot = slot._id;
   booking.date = date;
@@ -498,7 +597,39 @@ exports.cancel = asyncHandler(async (req, res) => {
   }
 
   if (refundAmount > 0) {
-    await creditWallet(booking.customer, refundAmount, 'refund', `Refund for cancelled booking ${booking.bookingCode}`, booking._id);
+    // If this booking was actually paid via Razorpay (online/token, not
+    // wallet), refund to the ORIGINAL payment method first — a wallet
+    // credit alone means money paid by card/UPI never reaches the customer's
+    // bank again. Falls back to wallet credit if there's no razorpay-paid
+    // record, the refund amount is 0, or the Razorpay call itself fails
+    // (e.g. already refunded, gateway error) so cancellation is never blocked.
+    const paidPayment = await Payment.findOne({
+      booking: booking._id, status: 'paid', type: { $in: ['token', 'full_online'] },
+    }).sort({ createdAt: -1 });
+
+    let razorpayRefunded = false;
+    if (paidPayment?.razorpayPaymentId) {
+      const capped = Math.min(refundAmount, paidPayment.amount);
+      try {
+        const result = await rp.refund(paidPayment.razorpayPaymentId, capped);
+        paidPayment.status = 'refunded';
+        paidPayment.refundId = result?.id;
+        await paidPayment.save();
+        razorpayRefunded = true;
+        // If the refund tier only covers part of what was paid (e.g. the
+        // 50% late-cancel tier), credit the rest to the wallet so the
+        // customer still gets the remainder even though it can't be split
+        // across two destinations in one Razorpay refund call.
+        if (capped < refundAmount) {
+          await creditWallet(booking.customer, refundAmount - capped, 'refund', `Partial refund (remainder) for cancelled booking ${booking.bookingCode}`, booking._id);
+        }
+      } catch (e) {
+        logger.error(`Razorpay refund failed for booking ${booking.bookingCode}, falling back to wallet credit: ${e.message}`);
+      }
+    }
+    if (!razorpayRefunded) {
+      await creditWallet(booking.customer, refundAmount, 'refund', `Refund for cancelled booking ${booking.bookingCode}`, booking._id);
+    }
     booking.paymentStatus = 'refunded';
   }
   if (goodwillPoints > 0) {
@@ -621,11 +752,31 @@ exports.walkIn = asyncHandler(async (req, res) => {
   });
   const queuePosition = queueCountBefore + 1;
 
+  // Reserve a Slot for the walk-in's occupied window so a customer booking
+  // ONLINE for the same staff right now can't double-book them — previously
+  // slot:null meant the online-booking overlap check (which only looks at the
+  // Slot collection) never saw this staff as busy. Best-effort: a walk-in is a
+  // front-desk fact already happening, so if slot reservation itself hits a
+  // conflict (e.g. staff already has an online booking right now), we still
+  // record the walk-in rather than blocking the front desk — just log it.
+  const totalDuration = services.reduce((s, x) => s + (x.durationMinutes || 0), 0);
+  const [wh, wm] = time.split(':').map(Number);
+  const wEndMin = wh * 60 + wm + totalDuration;
+  const walkInEndTime = `${String(Math.floor(wEndMin / 60)).padStart(2, '0')}:${String(wEndMin % 60).padStart(2, '0')}`;
+  let walkInSlot = null;
+  if (staff) {
+    try {
+      walkInSlot = await Slot.create({ salon, staff, date, startTime: time, endTime: walkInEndTime, status: 'booked' });
+    } catch (err) {
+      logger.warn(`walk-in slot reservation skipped (${err.message})`);
+    }
+  }
+
   const booking = await Booking.create({
     customer: req.user._id, // recorded under the salon account for walk-ins
     salon, staff,
     services: services.map((s) => ({ service: s._id, name: s.name, price: s.discountPrice || s.price, durationMinutes: s.durationMinutes })),
-    slot: null,
+    slot: walkInSlot ? walkInSlot._id : null,
     date, startTime: time,
     mode: 'salon',
     subtotal, discount: 0, total: subtotal, commission, salonPayout: subtotal - commission,
@@ -674,7 +825,10 @@ exports.verifyHomeOtp = asyncHandler(async (req, res) => {
 // POST /bookings/:id/tip   { amount }  (customer) — add a tip after completion
 exports.addTip = asyncHandler(async (req, res) => {
   const amount = parseInt(req.body.amount, 10);
-  if (!amount || amount < 1) throw ApiError.badRequest('Enter a valid tip amount');
+  // Had a floor but no ceiling — unlike wallet top-ups (capped at ₹1,00,000).
+  // Not a theft vector (customers only tip their own money), but an absurd or
+  // fat-fingered value would silently pollute booking.tip / payout aggregates.
+  if (!amount || amount < 1 || amount > 50000) throw ApiError.badRequest('Enter a valid tip amount (up to ₹50,000)');
   const booking = await Booking.findById(req.params.id);
   if (!booking) throw ApiError.notFound('Booking not found');
   if (booking.customer.toString() !== req.user._id.toString()) throw ApiError.forbidden('Not your booking');

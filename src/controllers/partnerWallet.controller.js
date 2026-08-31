@@ -148,6 +148,19 @@ module.exports.debitSalonWallet = async function debitSalonWallet(salonId, amoun
   return salon.walletBalance;
 };
 
+// Credit a staff member's wallet — used to reverse a failed payout (money
+// that was auto-debited for settlement but never actually reached the bank).
+module.exports.creditStaffWallet = async function creditStaffWallet(staffId, amount, source, description, reference) {
+  if (!amount || amount <= 0) return null;
+  const staff = await Staff.findByIdAndUpdate(staffId, { $inc: { walletBalance: amount } }, { new: true });
+  if (!staff) return null;
+  await PartnerWalletTransaction.create({
+    ownerType: 'staff', owner: staffId, type: 'credit', amount,
+    balanceAfter: staff.walletBalance, source, description, reference,
+  });
+  return staff.walletBalance;
+};
+
 // Debit a staff member's wallet — used by the T+1 settlement job.
 module.exports.debitStaffWallet = async function debitStaffWallet(staffId, amount, source, description, reference) {
   const staff = await Staff.findOneAndUpdate(

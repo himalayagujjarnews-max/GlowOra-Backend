@@ -6,7 +6,7 @@
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const sendResponse = require('../utils/ApiResponse');
-const { generateOtp, saveOtp, sendSms, verifyOtp, isOnCooldown } = require('../utils/otp');
+const { generateOtp, saveOtp, sendSms, verifyOtp, isOnCooldown, twilioEnabled } = require('../utils/otp');
 const { sendEmailOtp } = require('../utils/email');
 const { hashPassword, comparePassword, isStrong } = require('../utils/password');
 const { decrypt, sha256 } = require('../utils/encryption');
@@ -121,7 +121,14 @@ exports.sendOtp = asyncHandler(async (req, res) => {
   const otp = generateOtp();
   await saveOtp(phone, otp);
   await sendSms(phone, otp);
-  sendResponse(res, 200, 'OTP sent successfully', { phone, expiresInSeconds: config.otp.ttlSeconds });
+  // The customer app's OTP screen used to hardcode 6 digits for phone OTPs —
+  // correct ONLY when Twilio Verify is actually configured (it always sends
+  // 6-digit codes and ignores our locally-generated one). Without Twilio
+  // (dev/local, no SMS provider), sendSms() dev-logs our own LOCAL code,
+  // which is config.otp.length = 4 digits — a real mismatch that made phone
+  // login impossible in dev: the input required 6 digits before submitting,
+  // but the actual code was only 4. Tell the frontend the real length.
+  sendResponse(res, 200, 'OTP sent successfully', { phone, expiresInSeconds: config.otp.ttlSeconds, otpLength: twilioEnabled ? 6 : config.otp.length });
 });
 
 // POST /auth/verify-otp  { phone, otp, name?, role?, referralCode? }
@@ -159,15 +166,9 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
     isNew = true;
     sendWelcomeNotification(user);
 
-    // reward referrer
-    if (referredBy) {
-      await User.findByIdAndUpdate(referredBy, { $inc: { walletBalance: config.referralBonus } });
-      notifyUser(referredBy, {
-        title: 'Referral bonus! 🎉',
-        body: `You earned ₹${config.referralBonus} because ${name || 'a friend'} joined GlowOra.`,
-        type: 'promo',
-      });
-    }
+    // Referral bonus now pays out when this new user completes their FIRST
+    // booking, not here at signup (see booking.controller.js updateStatus) —
+    // avoids rewarding referrers for fake signups that never actually book.
   } else {
     user.phoneVerified = true;
     user.lastLoginAt = new Date();
@@ -234,14 +235,8 @@ exports.firebaseLogin = asyncHandler(async (req, res) => {
     isNew = true;
     sendWelcomeNotification(user);
 
-    if (referredBy) {
-      await User.findByIdAndUpdate(referredBy, { $inc: { walletBalance: config.referralBonus } });
-      notifyUser(referredBy, {
-        title: 'Referral bonus! 🎉',
-        body: `You earned ₹${config.referralBonus} because ${name || 'a friend'} joined GlowOra.`,
-        type: 'promo',
-      });
-    }
+    // Referral bonus now pays out when this new user completes their FIRST
+    // booking, not here at signup (see booking.controller.js updateStatus).
   } else {
     user.phoneVerified = true;
     user.lastLoginAt = new Date();
@@ -356,6 +351,11 @@ exports.appleLogin = asyncHandler(async (req, res) => {
 
   const email = String(payload.email || '').trim().toLowerCase();
   if (!email) throw ApiError.badRequest('No email on this Apple account');
+  // Apple's identityToken carries email_verified as the STRING 'true'/'false'
+  // (not a boolean, unlike Google's payload) — mirror googleLogin's check.
+  if (payload.email_verified === false || payload.email_verified === 'false') {
+    throw ApiError.unauthorized('Apple email is not verified');
+  }
 
   let user = await User.findOne({ email }).select('+twoFactorSecret +twoFactorBackupCodes');
   let isNew = false;
@@ -394,9 +394,14 @@ exports.appleLogin = asyncHandler(async (req, res) => {
   });
 });
 
-// POST /auth/login  { phone|email, password }  — login by phone OR email
+// POST /auth/login  { phone|email, password, role? }  — login by phone OR email.
+// Used by both the customer app (email+password mode) and the partner app —
+// unlike the OTP-based logins above, this never called resolveLoginRole, so
+// someone who last logged into the partner app (role='owner'/'staff') and
+// then password-logs-into the customer app kept the stale active role and
+// got 403'd on every customer-only action (booking create, etc).
 exports.login = asyncHandler(async (req, res) => {
-  const { phone, email, password } = req.body;
+  const { phone, email, password, role } = req.body;
   const identifier = email ? String(email).trim().toLowerCase() : phone;
   if (!identifier || !password) throw ApiError.badRequest('Phone/email and password are required');
 
@@ -436,6 +441,7 @@ exports.login = asyncHandler(async (req, res) => {
   user.loginAttempts = 0;
   user.lockUntil = undefined;
   user.lastLoginAt = new Date();
+  resolveLoginRole(user, role);
   await user.save();
 
   const tokens = await sessionService.createSession(user, reqCtx(req));
@@ -571,6 +577,12 @@ exports.verifyEmail = asyncHandler(async (req, res) => {
   user.emailVerified = true;
   user.lastLoginAt = new Date();
   if (name && !user.name) user.name = name;
+  // This endpoint is only ever called from the customer app's email-login
+  // flow — unlike the other login methods above, it never took a `role`
+  // param at all, so an owner/staff account logging into the customer app
+  // via email OTP kept its stale active role and got 403'd on customer-only
+  // actions. Always resolve back to 'customer' here.
+  resolveLoginRole(user, 'customer');
   await user.save();
 
   const tokens = await sessionService.createSession(user, reqCtx(req));

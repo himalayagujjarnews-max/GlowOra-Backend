@@ -60,6 +60,11 @@ const userSchema = new mongoose.Schema(
     totalSpent: { type: Number, default: 0, min: 0 },
     referralCode: { type: String, unique: true, sparse: true },
     referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // True once the referrer has been paid out for THIS user's first
+    // completed booking (see booking.controller.js updateStatus). Reward now
+    // fires on first completed booking, not at signup, so fake signups that
+    // never book can't be farmed for referral bonuses.
+    referralRewarded: { type: Boolean, default: false },
     fcmTokens: [{ type: String }],
     phoneVerified: { type: Boolean, default: false },
     emailVerified: { type: Boolean, default: false },

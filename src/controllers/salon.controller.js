@@ -14,6 +14,8 @@ const Review = require('../models/Review');
 const Booking = require('../models/Booking');
 const { notifyUser } = require('../services/notification.service');
 const { localYmd, localTime, addMinutes, escapeRegex } = require('../utils/helpers');
+const { creditWallet } = require('./wallet.controller');
+const logger = require('../utils/logger');
 
 // Live "crowd status" — a cheap, informational busy/free signal for salon
 // cards (not a precise queue; that's a separate partner-app feature). A
@@ -138,6 +140,13 @@ exports.search = asyncHandler(async (req, res) => {
   if (req.query.type) filter.type = req.query.type;
   if (req.query.q) filter.name = new RegExp(escapeRegex(req.query.q), 'i');
   if (req.query.minRating) filter.rating = { $gte: parseFloat(req.query.minRating) };
+  if (req.query.category) {
+    // Category filters by service, not by a field on Salon itself — find
+    // salons that actually offer an active service in this category
+    // (same approach as the `nearby` endpoint above).
+    const salonIds = await Service.find({ category: req.query.category, active: true }).distinct('salon');
+    filter._id = { $in: salonIds };
+  }
 
   const [salons, total] = await Promise.all([
     Salon.find(filter).sort(sortFor(req.query.sort)).skip(skip).limit(limit)
@@ -290,7 +299,8 @@ exports.pendingBankVerification = asyncHandler(async (req, res) => {
   })
     .select('+bankDetails +gstNumber +panNumber name bankVerified owner')
     .populate('owner', 'name phone')
-    .sort({ updatedAt: -1 });
+    .sort({ updatedAt: -1 })
+    .limit(500); // safety cap — this is an admin review queue, not meant to grow unbounded
   sendResponse(res, 200, 'Salons pending bank verification', { salons });
 });
 
@@ -315,6 +325,54 @@ exports.setStatus = asyncHandler(async (req, res) => {
     { new: true }
   );
   if (!salon) throw ApiError.notFound('Salon not found');
+
+  // Deactivating a salon (anything other than 'active') must not leave
+  // customers with pending/confirmed bookings that now point at a salon
+  // that can no longer serve them — auto-cancel + notify + refund, same as
+  // a normal cancellation (see booking.controller.js's cancel()).
+  if (status !== 'active') {
+    const affectedBookings = await Booking.find({
+      salon: salon._id,
+      status: { $in: ['pending', 'confirmed'] },
+      date: { $gte: localYmd() },
+    });
+
+    for (const booking of affectedBookings) {
+      booking.status = 'cancelled';
+      booking.cancelledBy = 'system';
+      booking.cancelReason = 'Salon deactivated by admin';
+      booking.communicationUnlocked = false;
+      await booking.save();
+
+      // NOTE: booking.controller.js's cancel() has real Razorpay-refund logic
+      // (refunds to the original payment method first, falling back to
+      // wallet credit). Reusing that here safely would need extracting it
+      // into a shared helper, which is out of scope for this admin-triggered
+      // path — as a minimum-bar fallback we credit the paid amount straight
+      // to the customer's wallet so no refund is silently lost.
+      if (booking.amountPaid > 0) {
+        try {
+          await creditWallet(
+            booking.customer,
+            booking.amountPaid,
+            'refund',
+            `Refund for booking ${booking.bookingCode} — salon deactivated by admin`,
+            booking._id
+          );
+        } catch (e) {
+          logger.error(`Wallet credit failed for booking ${booking.bookingCode} on salon deactivation: ${e.message}`);
+        }
+      }
+
+      notifyUser(booking.customer, {
+        title: 'Booking cancelled',
+        body: `Your booking at ${salon.name} was cancelled because the salon is no longer active. Any amount paid will be refunded to your wallet.`,
+        type: 'booking',
+        data: { bookingId: booking._id.toString() },
+      });
+    }
+  }
+
   sendResponse(res, 200, `Salon ${status}`, { salon });
 });
 

@@ -14,6 +14,12 @@ const serviceSchema = new mongoose.Schema(
     forGender: { type: String, enum: ['male', 'female', 'unisex'], default: 'unisex' },
     price: { type: Number, required: true, min: 0 },
     discountPrice: { type: Number, min: 0 },
+    // Optional — cost of goods/product/time the salon spends delivering this
+    // service (e.g. product cost). Only used for the profit-margin analytics
+    // (analytics.controller.js serviceMargin) — left unset (null) on existing
+    // services until the owner fills it in; margin is reported as "unknown"
+    // for services with no costPrice rather than assuming 0.
+    costPrice: { type: Number, min: 0, default: null },
     durationMinutes: { type: Number, required: true, min: 5 },
     description: { type: String, maxlength: 500 },
     image: { type: String },

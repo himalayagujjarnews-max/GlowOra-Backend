@@ -9,7 +9,7 @@ const paymentSchema = new mongoose.Schema(
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     amount: { type: Number, required: true },
     currency: { type: String, default: 'INR' },
-    type: { type: String, enum: ['token', 'full_online', 'refund', 'wallet_topup'], required: true },
+    type: { type: String, enum: ['token', 'full_online', 'refund', 'wallet_topup', 'subscription'], required: true },
 
     razorpayOrderId: { type: String, index: true },
     razorpayPaymentId: { type: String },

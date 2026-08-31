@@ -7,8 +7,10 @@ const sendResponse = require('../utils/ApiResponse');
 const Staff = require('../models/Staff');
 const Salon = require('../models/Salon');
 const User = require('../models/User');
+const Booking = require('../models/Booking');
 const { notifyUser } = require('../services/notification.service');
 const { uploadImage } = require('../config/cloudinary');
+const { localYmd } = require('../utils/helpers');
 
 async function assertOwnsSalon(user, salonId) {
   const salon = await Salon.findById(salonId);
@@ -106,6 +108,21 @@ exports.remove = asyncHandler(async (req, res) => {
   const staff = await Staff.findById(req.params.id);
   if (!staff) throw ApiError.notFound('Staff not found');
   await assertOwnsSalon(req.user, staff.salon);
+
+  // Don't let an owner silently strand upcoming bookings on a now-inactive
+  // staff member — they must reassign/cancel those bookings first (via the
+  // existing reschedule/cancel endpoints) before this soft-delete is allowed.
+  const upcomingBookings = await Booking.countDocuments({
+    staff: staff._id,
+    status: { $in: ['pending', 'confirmed', 'in_progress'] },
+    date: { $gte: localYmd() },
+  });
+  if (upcomingBookings > 0) {
+    throw ApiError.badRequest(
+      `This staff member has ${upcomingBookings} upcoming booking(s). Please reassign or cancel them before removing this staff member.`
+    );
+  }
+
   staff.active = false;
   await staff.save();
   sendResponse(res, 200, 'Staff removed');
@@ -185,7 +202,8 @@ exports.pendingBankVerification = asyncHandler(async (req, res) => {
   })
     .select('+bankDetails name salon user bankVerified')
     .populate('salon', 'name')
-    .sort({ updatedAt: -1 });
+    .sort({ updatedAt: -1 })
+    .limit(500); // safety cap — this is an admin review queue, not meant to grow unbounded
   sendResponse(res, 200, 'Staff pending bank verification', { staff });
 });
 

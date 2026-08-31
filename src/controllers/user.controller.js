@@ -116,7 +116,7 @@ exports.setBlock = asyncHandler(async (req, res) => {
 exports.adminListIdentityVerifications = asyncHandler(async (req, res) => {
   const status = req.query.status || 'pending';
   const filter = { 'identityVerification.status': status, role: { $in: ['owner', 'staff'] } };
-  const users = await User.find(filter).select('name phone email role identityVerification').sort({ 'identityVerification.submittedAt': 1 });
+  const users = await User.find(filter).select('name phone email role identityVerification').sort({ 'identityVerification.submittedAt': 1 }).limit(500);
   sendResponse(res, 200, 'Identity verifications', { users });
 });
 

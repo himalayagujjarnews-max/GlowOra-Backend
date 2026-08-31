@@ -9,7 +9,8 @@ router.get('/plans', ctrl.listPlans); // public
 router.use(protect);
 router.get('/mine', ctrl.mine);
 router.post('/salon/subscribe', restrictTo('owner', 'admin'), ctrl.salonSubscribe);
-router.post('/pass/buy', restrictTo('customer'), ctrl.buyPass);
+router.post('/pass/create-order', restrictTo('customer'), ctrl.createPassOrder);
+router.post('/pass/verify', restrictTo('customer'), ctrl.verifyPass);
 router.patch('/:id/cancel', ctrl.cancel);
 
 // admin plan management

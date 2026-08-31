@@ -6,6 +6,7 @@ const router = express.Router();
 
 router.use(protect, restrictTo('owner', 'staff', 'admin'));
 router.get('/', ctrl.list);
+router.get('/mine', ctrl.mine);
 router.get('/earnings', ctrl.earnings);
 router.post('/', ctrl.mark);
 

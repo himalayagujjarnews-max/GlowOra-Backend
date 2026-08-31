@@ -63,6 +63,12 @@ async function sendSms(phone, otp) {
     return { twilio: true };
   }
   if (!config.msg91.apiKey) {
+    // In production, refuse to silently log a real user's OTP to the server
+    // console — that's a live credential leak into logs/log aggregators.
+    // This path should only ever be hit in dev when no SMS provider is set up.
+    if (config.isProd) {
+      throw new Error('No SMS OTP provider configured (Twilio/MSG91) — refusing to log OTP in production.');
+    }
     // Use console.log directly so it ALWAYS shows, regardless of log level/format.
     console.log('\n============================================');
     console.log(`  📩  DEV OTP for ${phone}  =  ${otp}`);

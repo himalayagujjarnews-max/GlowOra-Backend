@@ -43,7 +43,7 @@ exports.update = asyncHandler(async (req, res) => {
   const service = await Service.findById(req.params.id);
   if (!service) throw ApiError.notFound('Service not found');
   await assertOwnsSalon(req.user, service.salon);
-  const allowed = ['name', 'category', 'forGender', 'price', 'discountPrice', 'durationMinutes', 'description', 'image', 'homeServiceAvailable', 'active'];
+  const allowed = ['name', 'category', 'forGender', 'price', 'discountPrice', 'costPrice', 'durationMinutes', 'description', 'image', 'homeServiceAvailable', 'active'];
   allowed.forEach((k) => { if (req.body[k] !== undefined) service[k] = req.body[k]; });
   await service.save();
   sendResponse(res, 200, 'Service updated', { service });

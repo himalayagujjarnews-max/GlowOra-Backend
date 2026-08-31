@@ -50,6 +50,7 @@ const aiRoutes = require('./ai.routes');
 const pointsLedgerRoutes = require('./pointsLedger.routes');
 const expenseRoutes = require('./expense.routes');
 const referralRoutes = require('./referral.routes');
+const blockoutRoutes = require('./blockout.routes');
 const docsRoutes = require('./docs.routes');
 
 const router = express.Router();
@@ -117,6 +118,7 @@ router.use('/ai', aiRoutes);
 router.use('/points-ledger', pointsLedgerRoutes);
 router.use('/expenses', expenseRoutes);
 router.use('/referral', referralRoutes);
+router.use('/blockouts', blockoutRoutes);
 router.use('/', docsRoutes); // /docs and /docs.json
 
 module.exports = router;

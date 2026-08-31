@@ -9,6 +9,8 @@ const sendResponse = require('../utils/ApiResponse');
 const Booking = require('../models/Booking');
 const Salon = require('../models/Salon');
 const Staff = require('../models/Staff');
+const Shift = require('../models/Shift');
+const Service = require('../models/Service');
 const { localYmd } = require('../utils/helpers');
 
 async function assertOwns(user, salonId) {
@@ -70,6 +72,31 @@ exports.peakHours = asyncHandler(async (req, res) => {
     { $sort: { _id: 1 } },
   ]);
   sendResponse(res, 200, 'Peak hours', { hours: agg });
+});
+
+// GET /analytics/:salonId/peak-hours-heatmap — same idea as peak-hours but
+// broken down by day-of-week too, for a proper day x hour heatmap in the UI
+// (peak-hours above stays hour-only, kept for backward compat with any
+// existing caller). `date` is stored as 'YYYY-MM-DD' so day-of-week is
+// derived with $dayOfWeek (1=Sun..7=Sat, Mongo's convention).
+exports.peakHoursHeatmap = asyncHandler(async (req, res) => {
+  const salon = await assertOwns(req.user, req.params.salonId);
+  const agg = await Booking.aggregate([
+    { $match: { salon: salon._id, status: { $ne: 'cancelled' } } },
+    {
+      $group: {
+        _id: {
+          // onError/onNull guard against any malformed `date` string blowing up
+          // the whole aggregation — those bookings just get excluded (_id.dayOfWeek: null).
+          dayOfWeek: { $subtract: [{ $dayOfWeek: { $dateFromString: { dateString: '$date', onError: null, onNull: null } } }, 1] },
+          hour: { $substr: ['$startTime', 0, 2] },
+        },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+  const cells = agg.map((a) => ({ dayOfWeek: a._id.dayOfWeek, hour: parseInt(a._id.hour, 10), count: a.count }));
+  sendResponse(res, 200, 'Peak hours heatmap', { cells });
 });
 
 // GET /analytics/:salonId/slow-periods — "smart offers" input: which
@@ -199,6 +226,95 @@ exports.revenueTrend = asyncHandler(async (req, res) => {
     { $limit: 12 },
   ]);
   sendResponse(res, 200, 'Revenue trend', { trend: agg });
+});
+
+// GET /analytics/:salonId/staff-utilization — booked hours vs. available
+// (shift) hours per staff over the last 30 days. Available hours are
+// derived from the weekly Shift roster (staff.shift.controller.js/Shift.js)
+// projected across the window; if a staff member has no shifts configured
+// at all, we report utilization as null (unknown) rather than dividing by
+// zero or silently assuming they're available 24/7.
+exports.staffUtilization = asyncHandler(async (req, res) => {
+  const salon = await assertOwns(req.user, req.params.salonId);
+  const since = new Date();
+  since.setDate(since.getDate() - 30);
+
+  const [bookedAgg, shifts, staffList] = await Promise.all([
+    Booking.aggregate([
+      { $match: { salon: salon._id, status: 'completed', completedAt: { $gte: since }, staff: { $ne: null } } },
+      { $unwind: '$services' },
+      { $group: { _id: '$staff', bookedMinutes: { $sum: '$services.durationMinutes' } } },
+    ]),
+    Shift.find({ salon: salon._id }),
+    Staff.find({ salon: salon._id }).select('name'),
+  ]);
+
+  const bookedByStaff = Object.fromEntries(bookedAgg.map((b) => [b._id.toString(), b.bookedMinutes || 0]));
+
+  // weekly available minutes per staff, from non-off shifts
+  const weeklyMinutesByStaff = {};
+  for (const s of shifts) {
+    if (s.isOff || !s.startTime || !s.endTime) continue;
+    const [sh, sm] = s.startTime.split(':').map(Number);
+    const [eh, em] = s.endTime.split(':').map(Number);
+    const minutes = Math.max(0, (eh * 60 + em) - (sh * 60 + sm));
+    const key = s.staff.toString();
+    weeklyMinutesByStaff[key] = (weeklyMinutesByStaff[key] || 0) + minutes;
+  }
+
+  const result = staffList.map((st) => {
+    const key = st._id.toString();
+    const bookedMinutes = bookedByStaff[key] || 0;
+    const hasShifts = weeklyMinutesByStaff[key] > 0;
+    // 30-day window ≈ 30/7 weeks of the configured weekly availability
+    const availableMinutes = hasShifts ? Math.round(weeklyMinutesByStaff[key] * (30 / 7)) : 0;
+    return {
+      staff: st._id,
+      name: st.name,
+      bookedHours: Math.round((bookedMinutes / 60) * 10) / 10,
+      availableHours: hasShifts ? Math.round((availableMinutes / 60) * 10) / 10 : null,
+      utilizationPercent: hasShifts ? Math.min(100, Math.round((bookedMinutes / availableMinutes) * 100)) : null,
+    };
+  });
+
+  sendResponse(res, 200, 'Staff utilization', { staff: result });
+});
+
+// GET /analytics/:salonId/service-margin — revenue and profit margin per
+// service, over completed bookings. Margin is only computed for services
+// the owner has set a costPrice on (Service.costPrice, added specifically
+// for this feature) — services without one show margin: null rather than a
+// misleading 100%/0% guess.
+exports.serviceMargin = asyncHandler(async (req, res) => {
+  const salon = await assertOwns(req.user, req.params.salonId);
+  const [agg, services] = await Promise.all([
+    Booking.aggregate([
+      { $match: { salon: salon._id, status: 'completed' } },
+      { $unwind: '$services' },
+      { $match: { 'services.service': { $ne: null } } },
+      { $group: { _id: '$services.service', count: { $sum: 1 }, revenue: { $sum: '$services.price' } } },
+    ]),
+    Service.find({ salon: salon._id }).select('name costPrice price'),
+  ]);
+  const serviceById = Object.fromEntries(services.map((s) => [s._id.toString(), s]));
+
+  const result = agg.map((a) => {
+    const svc = serviceById[a._id?.toString()];
+    const hasCost = svc && svc.costPrice != null;
+    const avgPrice = a.count ? a.revenue / a.count : 0;
+    const marginPercent = hasCost && avgPrice > 0
+      ? Math.round(((avgPrice - svc.costPrice) / avgPrice) * 100)
+      : null;
+    return {
+      service: a._id,
+      name: svc?.name || 'Unknown',
+      count: a.count,
+      revenue: a.revenue,
+      marginPercent,
+    };
+  });
+  result.sort((a, b) => b.revenue - a.revenue);
+  sendResponse(res, 200, 'Service margin', { services: result });
 });
 
 // GET /analytics/invoice/:bookingId  — invoice/receipt data (customer or salon)

@@ -63,12 +63,34 @@ exports.openConversation = asyncHandler(async (req, res) => {
   sendResponse(res, 200, 'Conversation', { conversation: conv });
 });
 
+// POST /chat/inquiry   { salonId }  — get or create a booking-less thread so
+// a customer can message a salon BEFORE booking (e.g. ask about
+// customization or timing). Routed to the salon owner's account since no
+// specific staff member is assigned yet. Not gated by communicationUnlocked
+// (that flag only applies to booking-scoped threads) or a `locked` flag —
+// stays open indefinitely, same as any pre-sales inquiry.
+exports.openInquiry = asyncHandler(async (req, res) => {
+  const { salonId } = req.body;
+  if (!salonId) throw ApiError.badRequest('salonId is required');
+  const salon = await Salon.findById(salonId);
+  if (!salon) throw ApiError.notFound('Salon not found');
+  if (req.user.role !== 'customer') throw ApiError.forbidden('Only customers can start a salon inquiry');
+
+  let conv = await Conversation.findOne({ customer: req.user._id, salon: salon._id, booking: { $exists: false } });
+  if (!conv) {
+    conv = await Conversation.create({ customer: req.user._id, staff: salon.owner, salon: salon._id });
+  }
+  sendResponse(res, 200, 'Conversation', { conversation: conv });
+});
+
 // GET /chat/conversations   — list my conversations
 exports.myConversations = asyncHandler(async (req, res) => {
   const uid = req.user._id;
   const convs = await Conversation.find({ $or: [{ customer: uid }, { staff: uid }] })
     .populate('salon', 'name coverImage')
     .populate('booking', 'bookingCode date status')
+    .populate('customer', 'name avatar')
+    .populate('staff', 'name avatar')
     .sort({ lastMessageAt: -1 });
   sendResponse(res, 200, 'Conversations', { conversations: convs });
 });

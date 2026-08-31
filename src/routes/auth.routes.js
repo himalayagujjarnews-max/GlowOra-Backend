@@ -21,7 +21,10 @@ router.post('/apple-login', authLimiter, [body('identityToken').notEmpty()], val
 router.post('/login', authLimiter, [body('password').notEmpty()], validate, ctrl.login);
 router.post('/forgot-password', authLimiter, [phoneRule], validate, ctrl.forgotPassword);
 router.post('/reset-password', authLimiter, [phoneRule, body('otp').notEmpty(), body('password').notEmpty()], validate, ctrl.resetPassword);
-router.post('/refresh', ctrl.refresh);
+// Every other auth route carries authLimiter — this one didn't, leaving
+// unlimited-rate hits against Session lookups (and reuse-detection-triggered
+// mass session revocation) with no throttle at all.
+router.post('/refresh', authLimiter, ctrl.refresh);
 
 // email verification / login
 router.post('/send-email-otp', authLimiter, [body('email').isEmail()], validate, ctrl.sendEmailOtp);

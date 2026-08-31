@@ -38,6 +38,11 @@ async function sendEmailOtp(email, otp) {
       <p style="color:#8a9a99">This code expires in a few minutes. If you didn't request it, ignore this email.</p>
     </div>`;
   if (!transporter) {
+    // Same rule as otp.js's SMS path — never log a real user's OTP to the
+    // console in production just because SMTP env vars are missing.
+    if (config.isProd) {
+      throw new Error('SMTP not configured — refusing to log email OTP in production.');
+    }
     console.log('\n============================================');
     console.log(`  📧  DEV EMAIL OTP for ${email}  =  ${otp}`);
     console.log('============================================\n');

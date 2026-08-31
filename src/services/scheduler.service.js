@@ -11,11 +11,17 @@
  *
  * All jobs are defensive (try/catch, skip-if-already-done flags) so a failure
  * in one run never crashes the server or double-fires.
+ *
+ * Jobs 1 and 5 also fire a WhatsApp template message alongside the push
+ * notification (see whatsapp.service.js) — no-ops until WHATSAPP_API_TOKEN /
+ * WHATSAPP_PHONE_NUMBER_ID are set, and requires the "appointment_reminder"
+ * / "booking_reminder" templates to be approved in Meta's WhatsApp Manager.
  */
 const cron = require('node-cron');
 const logger = require('../utils/logger');
 const { localYmd, commissionPercentFor } = require('../utils/helpers');
 const { notifyUser } = require('./notification.service');
+const { sendWhatsAppTemplate } = require('./whatsapp.service');
 
 const Booking = require('../models/Booking');
 const RecurringBooking = require('../models/RecurringBooking');
@@ -43,17 +49,24 @@ async function sendReminders() {
     status: { $in: ['confirmed', 'pending'] },
     reminderSent: false,
     date: today,
-  }).populate('salon', 'name owner').limit(200);
+  }).populate('salon', 'name owner').populate('customer', 'name phone').limit(200);
 
   for (const b of bookings) {
     // build the slot datetime in server local time
     const slotTime = new Date(`${b.date}T${b.startTime}:00`);
     if (slotTime > now && slotTime <= in1h) {
-      notifyUser(b.customer, {
+      notifyUser(b.customer?._id || b.customer, {
         title: 'Appointment reminder ⏰',
         body: `Your booking ${b.bookingCode} at ${b.salon?.name || 'the salon'} is at ${b.startTime}. See you soon!`,
         type: 'booking', data: { bookingId: b._id.toString() },
       });
+      // WhatsApp reminder alongside push — best-effort (see whatsapp.service.js).
+      // Requires an approved "appointment_reminder" template in WhatsApp Manager.
+      if (b.customer?.phone) {
+        sendWhatsAppTemplate(b.customer.phone, 'appointment_reminder', [
+          b.customer.name || 'there', b.salon?.name || 'the salon', b.startTime,
+        ]).catch(() => {});
+      }
       // notify assigned staff (their user account) if linked
       const staff = await Staff.findById(b.staff).select('user name');
       if (staff?.user) {
@@ -223,17 +236,26 @@ async function runAbandonedCartReminders() {
   const carts = await AbandonedCart.find({
     reminded: false,
     updatedAt: { $lte: cutoff },
-  }).populate('salon', 'name').limit(200);
+  }).populate('salon', 'name').populate('user', 'name phone').limit(200);
 
   for (const cart of carts) {
     try {
       if (!cart.salon) { cart.reminded = true; await cart.save(); continue; } // salon deleted/inactive — skip
-      notifyUser(cart.user, {
+      notifyUser(cart.user?._id || cart.user, {
         title: 'Still shopping? 👀',
         body: `You left something in your cart — complete your booking at ${cart.salon.name}!`,
         type: 'booking',
         data: { salonId: cart.salon._id.toString() },
       });
+      // WhatsApp reminder alongside push — best-effort, never blocks the
+      // main reminder flow (see whatsapp.service.js; no-ops until
+      // WHATSAPP_API_TOKEN/WHATSAPP_PHONE_NUMBER_ID are configured, and
+      // requires the "booking_reminder" template to be approved in Meta's
+      // WhatsApp Manager).
+      if (cart.user?.phone) {
+        sendWhatsAppTemplate(cart.user.phone, 'booking_reminder', [cart.user.name || 'there', cart.salon.name])
+          .catch(() => {});
+      }
       cart.reminded = true;
       await cart.save();
     } catch (err) {

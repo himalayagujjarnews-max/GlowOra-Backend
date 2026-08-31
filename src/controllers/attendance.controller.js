@@ -50,6 +50,18 @@ exports.mark = asyncHandler(async (req, res) => {
   sendResponse(res, 200, 'Attendance marked', { attendance: record });
 });
 
+// GET /attendance/mine?date=   (staff's OWN attendance record for a given
+// day, default today — used by the partner app to restore checkedIn/
+// checkInTime on mount/focus so a killed/backgrounded app doesn't lose
+// track of an existing check-in and overwrite it via mark()).
+exports.mine = asyncHandler(async (req, res) => {
+  const staffDoc = await Staff.findOne({ user: req.user._id });
+  if (!staffDoc) throw ApiError.notFound('No staff profile linked to your account');
+  const date = req.query.date || ymd();
+  const record = await StaffAttendance.findOne({ staff: staffDoc._id, date });
+  sendResponse(res, 200, 'Attendance', { attendance: record || null });
+});
+
 // GET /attendance?salon=&date=
 exports.list = asyncHandler(async (req, res) => {
   const { salon, date } = req.query;

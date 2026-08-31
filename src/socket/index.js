@@ -113,8 +113,23 @@ async function initSocket(httpServer) {
     });
 
     socket.on('message:read', async ({ conversationId }) => {
-      await Message.updateMany({ conversation: conversationId, sender: { $ne: socket.userId }, read: false }, { read: true });
-      socket.to(`conv:${conversationId}`).emit('message:read', { by: socket.userId });
+      try {
+        await Message.updateMany({ conversation: conversationId, sender: { $ne: socket.userId }, read: false }, { read: true });
+        // The REST GET /messages endpoint resets conv.unread* when it marks
+        // messages read, but this socket path (used live, while the chat
+        // screen is already open) never did — so an unread badge on the
+        // conversation list wouldn't clear until the next full reopen of the
+        // thread. Mirror the REST behaviour here too.
+        const conv = await Conversation.findById(conversationId);
+        if (conv) {
+          const isCustomer = conv.customer.toString() === socket.userId;
+          if (isCustomer) conv.unreadCustomer = 0; else conv.unreadStaff = 0;
+          await conv.save();
+        }
+        socket.to(`conv:${conversationId}`).emit('message:read', { by: socket.userId });
+      } catch (err) {
+        logger.error(`socket message:read error: ${err.message}`);
+      }
     });
 
     // ---- Live stylist location tracking (home-service bookings) ----

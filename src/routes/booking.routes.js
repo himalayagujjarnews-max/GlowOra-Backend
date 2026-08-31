@@ -20,6 +20,7 @@ router.get('/mine', ctrl.getMine);
 router.get('/staff-mine', restrictTo('staff', 'admin'), ctrl.getStaffMine);
 router.get('/salon/:salonId', restrictTo('owner', 'staff', 'admin'), ctrl.getForSalon);
 router.get('/salon/:salonId/queue', restrictTo('owner', 'staff', 'admin'), ctrl.getQueueForSalon);
+router.get('/:id', ctrl.getOne);
 router.patch('/:id/status', restrictTo('owner', 'staff', 'admin'), ctrl.updateStatus);
 router.patch('/:id/reschedule', restrictTo('customer'), ctrl.reschedule);
 router.patch('/:id/cancel', ctrl.cancel);
