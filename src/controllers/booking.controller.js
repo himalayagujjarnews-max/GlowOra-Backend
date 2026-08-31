@@ -42,33 +42,55 @@ function buildSlots(openTime, closeTime, step = 30) {
 }
 
 // GET /api/v1/bookings/availability?salon=&staff=&date=
+// `staff` is OPTIONAL — when omitted (customer picked "Any available
+// stylist" on Booking.js), this returns the UNION of availability across
+// every active staff member at the salon: a slot is available if AT LEAST
+// one active stylist is free at that time. This mirrors what create() now
+// actually does when staff is omitted (auto-assigns whichever active staff
+// member is genuinely free for the chosen window) — previously this
+// endpoint hard-required `staff` and 400'd on omission, so the frontend's
+// "Any stylist" flow silently fell back to a hardcoded, completely fake
+// slot list disconnected from real availability.
 exports.getAvailability = asyncHandler(async (req, res) => {
   const { salon, staff, date } = req.query;
-  if (!salon || !staff || !date) throw ApiError.badRequest('salon, staff and date are required');
+  if (!salon || !date) throw ApiError.badRequest('salon and date are required');
 
   const salonDoc = await Salon.findById(salon);
   if (!salonDoc) throw ApiError.notFound('Salon not found');
 
   const all = buildSlots(salonDoc.openTime || '09:00', salonDoc.closeTime || '20:00');
-  const taken = await Slot.find({ staff, date, status: { $in: ['booked', 'held'] } }).select('startTime');
-  const takenSet = new Set(taken.map((s) => s.startTime));
 
-  // Also block slots that fall within any active staff blockout for this date.
-  // An all-day blockout (startTime=null) marks every slot unavailable.
-  const blockouts = staff
-    ? await StaffBlockout.find({ staff, date }).select('startTime endTime')
-    : [];
+  const staffIds = staff
+    ? [staff]
+    : (await Staff.find({ salon, active: true }).select('_id')).map((s) => s._id.toString());
 
-  function isBlockedOut(slotTime) {
-    if (!blockouts.length) return false;
-    for (const b of blockouts) {
-      if (!b.startTime) return true; // all-day blockout
-      if (slotTime >= b.startTime && slotTime < b.endTime) return true;
-    }
-    return false;
+  if (staffIds.length === 0) {
+    // no staff to check against (single explicit staff id that doesn't
+    // exist, or a salon with zero active stylists) — nothing is bookable
+    return sendResponse(res, 200, 'Availability', { date, slots: all.map((t) => ({ time: t, available: false })) });
   }
 
-  const slots = all.map((t) => ({ time: t, available: !takenSet.has(t) && !isBlockedOut(t) }));
+  const [taken, blockouts] = await Promise.all([
+    Slot.find({ staff: { $in: staffIds }, date, status: { $in: ['booked', 'held'] } }).select('staff startTime'),
+    // Only 'approved' blockouts count — a staff-submitted leave REQUEST
+    // (status 'pending') must not free up their calendar until the owner
+    // actually approves it, or customers could book against unavailable staff.
+    StaffBlockout.find({ staff: { $in: staffIds }, date, status: 'approved' }).select('staff startTime endTime'),
+  ]);
+
+  const takenByStaff = {};
+  taken.forEach((s) => { const k = s.staff.toString(); (takenByStaff[k] = takenByStaff[k] || new Set()).add(s.startTime); });
+  const blockoutsByStaff = {};
+  blockouts.forEach((b) => { const k = b.staff.toString(); (blockoutsByStaff[k] = blockoutsByStaff[k] || []).push(b); });
+
+  function isStaffFreeAt(staffId, slotTime) {
+    if (takenByStaff[staffId]?.has(slotTime)) return false;
+    const bl = blockoutsByStaff[staffId];
+    if (bl && bl.some((b) => !b.startTime || (slotTime >= b.startTime && slotTime < b.endTime))) return false;
+    return true;
+  }
+
+  const slots = all.map((t) => ({ time: t, available: staffIds.some((id) => isStaffFreeAt(id, t)) }));
   sendResponse(res, 200, 'Availability', { date, slots });
 });
 
@@ -91,12 +113,11 @@ exports.create = asyncHandler(async (req, res) => {
   const salonDoc = await Salon.findById(salon);
   if (!salonDoc || salonDoc.status !== 'active') throw ApiError.notFound('Salon not available');
 
-  // If no staff chosen, auto-assign the salon's first active stylist (so the
-  // booking still routes to someone). If the salon has no staff, allow null.
-  if (!staff) {
-    const anyStaff = await Staff.findOne({ salon, active: true });
-    staff = anyStaff ? anyStaff._id : null;
-  }
+  // If staff was explicitly chosen, validate it now. If omitted ("Any
+  // available stylist"), the actual auto-assignment happens further below
+  // (after we know the booking's [startTime,endTime) window) — picking
+  // whoever is genuinely FREE at that time, not just the salon's first
+  // active stylist regardless of their availability.
   let staffDoc = null;
   if (staff) {
     staffDoc = await Staff.findById(staff);
@@ -153,10 +174,49 @@ exports.create = asyncHandler(async (req, res) => {
   const startMin = h * 60 + m;
   const endMin = startMin + totalDuration;
   const endTime = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
+  const toMin = (t) => { const [hh, mm] = t.split(':').map(Number); return hh * 60 + mm; };
+
+  // "Any available stylist" — staff was omitted, so auto-assign whoever is
+  // actually FREE for this exact [startTime,endTime) window (no Slot
+  // conflict, no approved blockout). This used to just grab the salon's
+  // first active stylist with zero regard for whether THEY were free,
+  // which meant an "Any stylist" booking could get assigned to someone
+  // already booked at that time and then immediately 409 on the overlap
+  // check below — even when a different stylist was completely open.
+  // Mirrors the union-availability logic in getAvailability() above.
+  if (!staff) {
+    const activeStaff = await Staff.find({ salon, active: true }).select('_id name user');
+    if (activeStaff.length) {
+      const staffIds = activeStaff.map((s) => s._id);
+      const [existingSlots, blockouts] = await Promise.all([
+        Slot.find({ staff: { $in: staffIds }, date, status: { $in: ['booked', 'held'] } }).select('staff startTime endTime'),
+        StaffBlockout.find({ staff: { $in: staffIds }, date, status: 'approved' }).select('staff startTime endTime'),
+      ]);
+      const isFree = (staffId) => {
+        const sId = staffId.toString();
+        const slotConflict = existingSlots.some((s) => {
+          if (s.staff.toString() !== sId) return false;
+          const sS = toMin(s.startTime); const sE = toMin(s.endTime || s.startTime);
+          return startMin < sE && endMin > sS;
+        });
+        if (slotConflict) return false;
+        return !blockouts.some((b) => {
+          if (b.staff.toString() !== sId) return false;
+          if (!b.startTime) return true; // all-day blockout
+          return startMin < toMin(b.endTime) && endMin > toMin(b.startTime);
+        });
+      };
+      const freeStaff = activeStaff.find((s) => isFree(s._id));
+      if (!freeStaff) throw ApiError.conflict('No stylist is free at that time. Please pick another slot.');
+      staff = freeStaff._id;
+      staffDoc = freeStaff;
+    }
+    // salon has zero active staff at all — fall through with staff left null,
+    // same as the pre-existing "allow null" behavior below.
+  }
 
   // overlap check — a booking's whole [start,end) window must be free for this staff
   const sameDay = await Slot.find({ staff, date, status: { $in: ['booked', 'held'] } }).select('startTime endTime');
-  const toMin = (t) => { const [hh, mm] = t.split(':').map(Number); return hh * 60 + mm; };
   const clash = sameDay.some((s) => {
     const sS = toMin(s.startTime); const sE = toMin(s.endTime || s.startTime);
     return startMin < sE && endMin > sS; // intervals overlap
@@ -444,18 +504,64 @@ exports.updateStatus = asyncHandler(async (req, res) => {
     // customer completes their first booking (not at signup). This closes
     // the old loophole where a fake signup with no real booking could still
     // farm the referral bonus.
+    //
+    // The "first completed booking" check below (countDocuments) is
+    // NOT race-free by itself: if a customer's second-ever booking is
+    // completed concurrently with their first, both requests can read
+    // priorCompleted === 0 before either write lands. What actually
+    // prevents a double payout is the atomic findOneAndUpdate immediately
+    // after — it flips referralRewarded from false -> true in a single
+    // compare-and-swap, so only ONE of the concurrent requests gets back a
+    // non-null `claimed` doc and only that one credits the wallet.
     if (customerBefore?.referredBy && !customerBefore.referralRewarded) {
       const priorCompleted = await Booking.countDocuments({
         customer: booking.customer, status: 'completed', _id: { $ne: booking._id },
       });
       if (priorCompleted === 0) {
-        await User.findByIdAndUpdate(booking.customer, { referralRewarded: true });
-        await User.findByIdAndUpdate(customerBefore.referredBy, { $inc: { walletBalance: config.referralBonus } });
-        notifyUser(customerBefore.referredBy, {
-          title: 'Referral bonus! 🎉',
-          body: `You earned ₹${config.referralBonus} — your friend just completed their first booking on GlowOra.`,
-          type: 'promo',
-        });
+        const claimed = await User.findOneAndUpdate(
+          { _id: booking.customer, referralRewarded: false },
+          { referralRewarded: true }
+        );
+        if (claimed) {
+          await User.findByIdAndUpdate(customerBefore.referredBy, { $inc: { walletBalance: config.referralBonus } });
+          notifyUser(customerBefore.referredBy, {
+            title: 'Referral bonus! 🎉',
+            body: `You earned ₹${config.referralBonus} — your friend just completed their first booking on GlowOra.`,
+            type: 'promo',
+          });
+        }
+      }
+    }
+
+    // Salon-to-salon referral reward — same anti-farming logic (and the same
+    // atomic-claim pattern to prevent a double payout) as the customer
+    // referral above, but scoped to the SALON: pays the REFERRING salon's
+    // wallet only once the REFERRED salon completes its first booking ever
+    // (not at signup).
+    const salonBefore = await Salon.findById(booking.salon._id).select('referredBy referralRewarded');
+    if (salonBefore?.referredBy && !salonBefore.referralRewarded) {
+      const priorSalonCompleted = await Booking.countDocuments({
+        salon: booking.salon._id, status: 'completed', _id: { $ne: booking._id },
+      });
+      if (priorSalonCompleted === 0) {
+        const claimedSalon = await Salon.findOneAndUpdate(
+          { _id: booking.salon._id, referralRewarded: false },
+          { referralRewarded: true }
+        );
+        if (claimedSalon) {
+          const referrerSalon = await Salon.findById(salonBefore.referredBy).select('owner');
+          if (referrerSalon) {
+            await creditSalonWallet(
+              referrerSalon._id, config.salonReferralBonus, 'referral_bonus',
+              'Salon referral bonus — a salon you referred completed its first booking', booking._id
+            );
+            notifyUser(referrerSalon.owner, {
+              title: 'Referral bonus! 🎉',
+              body: `You earned ₹${config.salonReferralBonus} — a salon you referred just completed its first booking on GlowOra.`,
+              type: 'promo',
+            });
+          }
+        }
       }
     }
 

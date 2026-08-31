@@ -151,6 +151,10 @@ const config = {
   onlineDiscountPercent: parseFloat(process.env.ONLINE_DISCOUNT_PERCENT) || 5,
   loyaltyPointsPerRupee: parseFloat(process.env.LOYALTY_POINTS_PER_RUPEE) || 0.1,
   referralBonus: parseInt(process.env.REFERRAL_BONUS, 10) || 50,
+  // Salon-to-salon referral — credited to the REFERRING salon's wallet when
+  // the salon they referred completes its first booking (see
+  // booking.controller.js updateStatus, mirrors the customer referral above).
+  salonReferralBonus: parseInt(process.env.SALON_REFERRAL_BONUS, 10) || 200,
   // No-show / very-late-cancellation penalty — a small flat amount debited
   // from the customer's wallet (see booking.controller.js cancel/updateStatus).
   // Best-effort: if the wallet balance can't cover it, the penalty is simply

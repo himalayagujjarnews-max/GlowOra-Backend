@@ -1,6 +1,7 @@
 const express = require('express');
 const { protect, restrictTo } = require('../middleware/auth');
 const upload = require('../middleware/upload');
+const { broadcastLimiter } = require('../middleware/rateLimiter');
 const ctrl = require('../controllers/salon.controller');
 
 const router = express.Router();
@@ -22,8 +23,14 @@ router.patch('/:id/feature', protect, restrictTo('admin'), ctrl.toggleFeature);
 // images
 router.post('/:id/images', protect, restrictTo('owner', 'admin'), upload.array('images', 8), ctrl.uploadImages);
 
-// broadcast a message to this salon's own past customers (owner only)
-router.post('/:id/broadcast', protect, restrictTo('owner', 'admin'), ctrl.broadcast);
+// broadcast a message to this salon's own past customers (owner only) —
+// rate-limited per salon so an owner can't spam their whole customer base
+// (or the same small win-back list) repeatedly with no cooldown.
+router.post('/:id/broadcast', protect, restrictTo('owner', 'admin'), broadcastLimiter, ctrl.broadcast);
+// targeted win-back message to specific (usually dormant) past customers
+router.post('/:id/win-back', protect, restrictTo('owner', 'admin'), broadcastLimiter, ctrl.winBack);
+// salons this salon has referred, plus its own referral code
+router.get('/:id/referrals', protect, restrictTo('owner', 'admin'), ctrl.referrals);
 
 // public detail + owner update (keep params last)
 router.get('/:id', ctrl.getById);

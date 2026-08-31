@@ -16,6 +16,11 @@ const blockoutSchema = new mongoose.Schema(
     startTime: { type: String, default: null }, // 'HH:mm'
     endTime: { type: String, default: null },   // 'HH:mm'
     reason: { type: String, default: '' },
+    // Owner-created blockouts (the original use-case) are effective
+    // immediately — 'approved' by default. Staff can also self-request a
+    // blockout (see blockout.controller.js requestLeave), which starts as
+    // 'pending' and does NOT block availability until the owner approves it.
+    status: { type: String, enum: ['approved', 'pending', 'rejected'], default: 'approved', index: true },
   },
   { timestamps: true }
 );

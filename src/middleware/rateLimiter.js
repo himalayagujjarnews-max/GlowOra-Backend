@@ -64,4 +64,25 @@ const authLimiter = rateLimit({
   message: { success: false, message: 'Too many attempts. Please wait before trying again.' },
 });
 
-module.exports = { apiLimiter, authLimiter };
+// Cooldown for salon.controller.js's broadcast()/winBack() — both fan out a
+// promotional push notification to every past customer (broadcast) or a
+// chosen slice of them (win-back). Neither had ANY throttling: an owner
+// could hit either endpoint in a tight loop and spam the exact same small
+// customer list repeatedly (there's no dedup on the notification side), or
+// simply fat-finger the button multiple times before the UI's own `sending`
+// guard had a chance to disable it. Keyed by the salon id in the route
+// param (not the caller's IP) — the abuse this guards against is "this
+// SALON's customers got spammed", not "this device made too many requests",
+// so the cooldown should follow the salon regardless of which device/network
+// the owner (or an admin acting on their behalf) sends from.
+const broadcastLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: redisStoreIfAvailable(),
+  keyGenerator: (req) => `broadcast:${req.params.id}`,
+  message: { success: false, message: 'You can send a few of these per hour — please wait before sending another message to your customers.' },
+});
+
+module.exports = { apiLimiter, authLimiter, broadcastLimiter };

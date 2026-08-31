@@ -159,7 +159,14 @@ exports.search = asyncHandler(async (req, res) => {
 
 // GET /api/v1/salons/:id  (full detail with services + staff + packages)
 exports.getById = asyncHandler(async (req, res) => {
-  const salon = await Salon.findById(req.params.id).populate('owner', 'name');
+  // Exclude the salon-to-salon referral fields — this endpoint is hit by
+  // anyone (customers via the public salon page, partner apps checking a
+  // salon's detail) and unlike getNearby/search (which already restrict to
+  // DISCOVERY_SELECT), it had no field restriction at all, so `referredBy`/
+  // `referralRewarded` — an owner-only business relationship, already
+  // correctly scoped to owners-only in the dedicated referrals() endpoint —
+  // was leaking to anyone who hit this URL.
+  const salon = await Salon.findById(req.params.id).select('-referredBy -referralRewarded').populate('owner', 'name');
   if (!salon || salon.status !== 'active') throw ApiError.notFound('Salon not found');
 
   const [services, staff, packages, reviews, [salonWithCrowdStatus]] = await Promise.all([
@@ -199,9 +206,23 @@ exports.uploadImages = asyncHandler(async (req, res) => {
 // (see tryActivateSalon) once the owner adds at least one photo and one
 // service — no admin wait, but also no empty salons in search results.
 exports.create = asyncHandler(async (req, res) => {
-  const { name, type, description, address, location, offersHomeService, openTime, closeTime } = req.body;
+  const { name, type, description, address, location, offersHomeService, openTime, closeTime, referralCode } = req.body;
   if (!name || !type || !address?.city || !location?.coordinates) {
     throw ApiError.badRequest('name, type, address.city and location.coordinates are required');
+  }
+  // Salon-to-salon referral — if this new owner entered another salon's
+  // referral code, link them. The reward isn't credited yet: see
+  // booking.controller.js updateStatus, which pays out only once THIS new
+  // salon completes its first real booking (prevents fake-salon farming).
+  // Deliberately ignore a code that resolves to a salon the SAME owner
+  // already runs — otherwise a multi-branch owner could refer their own new
+  // branch to themselves, then trivially trigger "first completed booking"
+  // via walkIn() with a ₹0 service, farming config.salonReferralBonus with
+  // zero real economic activity (repeatable across up to 10 salons/owner).
+  let referredBy;
+  if (referralCode && typeof referralCode === 'string' && referralCode.trim()) {
+    const referrer = await Salon.findOne({ referralCode: referralCode.trim().toUpperCase() }).select('_id owner');
+    if (referrer && referrer.owner.toString() !== req.user._id.toString()) referredBy = referrer._id;
   }
   // Multi-branch support: owners can register more than one salon (e.g. a
   // second location in another area). We only apply a generous soft cap —
@@ -221,6 +242,7 @@ exports.create = asyncHandler(async (req, res) => {
     name, type, description, address, location,
     offersHomeService, openTime, closeTime,
     status: 'pending',
+    referredBy,
   });
   sendResponse(res, 201, 'Salon created — add photos and a service to go live', { salon });
 });
@@ -410,4 +432,60 @@ exports.broadcast = asyncHandler(async (req, res) => {
     notifyUser(customerId, { title, body, type: 'promo', data: { salonId: salon._id.toString() } });
   });
   sendResponse(res, 200, 'Message sent to your customers', { recipients: customerIds.length });
+});
+
+// POST /api/v1/salons/:id/win-back  { customerIds: [...], title, body }  (owner of this salon)
+// Targeted version of broadcast() above — instead of messaging ALL past
+// customers, the owner picks specific (usually dormant/inactive) customers
+// from analytics.controller.js's dormantCustomers list and sends them a
+// win-back nudge. customerIds is intersected against this salon's actual
+// past customers so an owner can't be tricked into spamming arbitrary users.
+exports.winBack = asyncHandler(async (req, res) => {
+  const { customerIds, title, body } = req.body;
+  if (!title || !body) throw ApiError.badRequest('title and body are required');
+  if (!Array.isArray(customerIds) || customerIds.length === 0) {
+    throw ApiError.badRequest('customerIds must be a non-empty array');
+  }
+
+  const salon = await Salon.findById(req.params.id);
+  if (!salon) throw ApiError.notFound('Salon not found');
+  if (salon.owner.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    throw ApiError.forbidden('Not your salon');
+  }
+
+  const validCustomerIds = await Booking.find({
+    salon: salon._id, customer: { $in: customerIds },
+  }).distinct('customer');
+
+  validCustomerIds.forEach((customerId) => {
+    notifyUser(customerId, { title, body, type: 'promo', data: { salonId: salon._id.toString(), winBack: true } });
+  });
+
+  sendResponse(res, 200, 'Win-back message sent', { recipients: validCustomerIds.length });
+});
+
+// GET /api/v1/salons/:id/referrals  (owner of this salon)
+// This salon's own shareable referral code, plus every salon that signed up
+// using it — with whether each one has already triggered the reward
+// (referralRewarded flips true on their first completed booking, see
+// booking.controller.js updateStatus).
+exports.referrals = asyncHandler(async (req, res) => {
+  const salon = await Salon.findById(req.params.id).select('owner referralCode');
+  if (!salon) throw ApiError.notFound('Salon not found');
+  if (salon.owner.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    throw ApiError.forbidden('Not your salon');
+  }
+
+  const referred = await Salon.find({ referredBy: salon._id })
+    .select('name status createdAt referralRewarded')
+    .sort({ createdAt: -1 });
+
+  sendResponse(res, 200, 'Referrals', {
+    referralCode: salon.referralCode,
+    referred: referred.map((s) => ({
+      _id: s._id, name: s.name, status: s.status,
+      joinedAt: s.createdAt, rewarded: s.referralRewarded,
+    })),
+    rewardedCount: referred.filter((s) => s.referralRewarded).length,
+  });
 });

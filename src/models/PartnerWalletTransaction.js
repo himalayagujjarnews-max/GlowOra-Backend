@@ -31,6 +31,7 @@ const partnerWalletTxnSchema = new mongoose.Schema(
         'transfer_out',    // owner -> staff peer transfer, salon side
         'payout',          // T+1 auto-settlement debit to bank account
         'admin_adjust',    // manual correction by admin
+        'referral_bonus',  // a salon this owner referred completed its first booking
       ],
       required: true,
     },

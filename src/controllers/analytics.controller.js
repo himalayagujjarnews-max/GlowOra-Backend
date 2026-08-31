@@ -11,6 +11,7 @@ const Salon = require('../models/Salon');
 const Staff = require('../models/Staff');
 const Shift = require('../models/Shift');
 const Service = require('../models/Service');
+const User = require('../models/User');
 const { localYmd } = require('../utils/helpers');
 
 async function assertOwns(user, salonId) {
@@ -180,6 +181,52 @@ exports.retention = asyncHandler(async (req, res) => {
     repeatCustomers: repeat,
     retentionRate: total ? Math.round((repeat / total) * 100) : 0,
   });
+});
+
+// GET /analytics/:salonId/dormant-customers?days=60
+// Customers who've completed a booking at this salon before but haven't
+// booked again in `days` days — feeds the owner's "win-back" tool
+// (salon.controller.js winBack). Sorted most-dormant first so the owner
+// can prioritize whoever's been gone longest.
+exports.dormantCustomers = asyncHandler(async (req, res) => {
+  const salon = await assertOwns(req.user, req.params.salonId);
+  // Floor AND ceiling — an unbounded `days` produces a degenerate cutoff
+  // Date arbitrarily far in the past; 3650 (10 years) is generous enough for
+  // any real use of this tool while still being a sane sanity limit.
+  const days = Math.min(3650, Math.max(1, parseInt(req.query.days, 10) || 60));
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const agg = await Booking.aggregate([
+    // Every current code path that sets status:'completed' also sets
+    // completedAt in the same write, but this match is a defensive guard
+    // against a booking somehow completed without it (legacy data, a future
+    // code path that forgets it, a manual DB edit): MongoDB's BSON type
+    // ordering ranks Null < Date, so without this a null completedAt would
+    // satisfy `$lte: cutoff` and get sorted to the very top as if it were
+    // the MOST dormant customer, feeding straight into the win-back list.
+    { $match: { salon: salon._id, status: 'completed', completedAt: { $exists: true, $ne: null } } },
+    { $group: { _id: '$customer', lastVisit: { $max: '$completedAt' }, totalVisits: { $sum: 1 }, totalSpent: { $sum: '$total' } } },
+    { $match: { lastVisit: { $lte: cutoff } } },
+    { $sort: { lastVisit: 1 } },
+    { $limit: 200 },
+  ]);
+
+  const users = await User.find({ _id: { $in: agg.map((a) => a._id) } }).select('name phone avatar');
+  const byId = Object.fromEntries(users.map((u) => [u._id.toString(), u]));
+
+  const customers = agg
+    .filter((a) => byId[a._id?.toString()])
+    .map((a) => {
+      const u = byId[a._id.toString()];
+      const daysSince = Math.floor((Date.now() - new Date(a.lastVisit).getTime()) / (24 * 60 * 60 * 1000));
+      return {
+        _id: u._id, name: u.name, phone: u.phone, avatar: u.avatar,
+        lastVisit: a.lastVisit, daysSinceLastVisit: daysSince,
+        totalVisits: a.totalVisits, totalSpent: a.totalSpent,
+      };
+    });
+
+  sendResponse(res, 200, 'Dormant customers', { customers, days });
 });
 
 // GET /analytics/:salonId/staff-performance

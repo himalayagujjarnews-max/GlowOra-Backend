@@ -17,6 +17,7 @@ router.get('/:salonId/peak-hours', ctrl.peakHours);
 router.get('/:salonId/peak-hours-heatmap', ctrl.peakHoursHeatmap);
 router.get('/:salonId/slow-periods', ctrl.suggestSlowPeriods);
 router.get('/:salonId/retention', ctrl.retention);
+router.get('/:salonId/dormant-customers', ctrl.dormantCustomers);
 router.get('/:salonId/staff-performance', ctrl.staffPerformance);
 router.get('/:salonId/staff-utilization', ctrl.staffUtilization);
 router.get('/:salonId/service-margin', ctrl.serviceMargin);

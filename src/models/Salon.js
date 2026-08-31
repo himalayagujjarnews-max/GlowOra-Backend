@@ -93,6 +93,15 @@ const salonSchema = new mongoose.Schema(
     },
     isFeatured: { type: Boolean, default: false },
     rejectionReason: { type: String },
+
+    // Salon-to-salon referral (owner invites another salon owner to join
+    // GlowOra) — mirrors User.js's customer referralCode/referredBy pattern.
+    // Reward is credited to the REFERRING salon's wallet once the referred
+    // salon completes its first booking (see booking.controller.js), not at
+    // signup, for the same anti-farming reason as the customer version.
+    referralCode: { type: String, unique: true, sparse: true },
+    referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Salon' },
+    referralRewarded: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -103,6 +112,9 @@ salonSchema.index({ 'address.city': 1, status: 1 });
 salonSchema.pre('save', function (next) {
   if (this.isModified('name') || !this.slug) {
     this.slug = `${slugify(this.name, { lower: true, strict: true })}-${this._id.toString().slice(-5)}`;
+  }
+  if (!this.referralCode) {
+    this.referralCode = `SLN${this._id.toString().slice(-6).toUpperCase()}`;
   }
   next();
 });
